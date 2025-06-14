@@ -66,7 +66,7 @@ jobs:
               socketio.run(app, host='0.0.0.0', port=8000)
           PY
 
-          # Dashboard HTML
+          # Dashboard HTML with CDN client
           cat <<'HTML' > static/index.html
           <!doctype html>
           <html lang="en">
@@ -74,6 +74,7 @@ jobs:
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>API Dashboard</title>
+            <link rel="icon" href="#">
           </head>
           <body>
             <h1>API Dashboard</h1>
@@ -85,7 +86,7 @@ jobs:
             <pre id="chat" style="height:200px; overflow:auto; border:1px solid #ccc;"></pre>
             <h2>Logs</h2>
             <pre id="logs" style="height:200px; overflow:auto; border:1px solid #ccc;"></pre>
-            <script src="/socket.io/socket.io.js"></script>
+            <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
             <script>
               document.addEventListener('DOMContentLoaded', ()=>{
                 console.log('Dashboard loaded');
