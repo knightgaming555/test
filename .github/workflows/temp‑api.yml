@@ -1,11 +1,11 @@
 name: temp-api
-on: workflow_dispatch         # run it on‑demand
+on: workflow_dispatch
 
 jobs:
   api:
     runs-on: ubuntu-latest
     env:
-      NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}   # add this secret in repo settings
+      NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -14,9 +14,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y jq
+          pip install flask >/dev/null
+
       - name: Create a tiny Flask app
         run: |
-          pip install flask >/dev/null
           cat <<'PY' > api.py
           from flask import Flask, jsonify
           app = Flask(__name__)
@@ -29,14 +34,19 @@ jobs:
               app.run(host="0.0.0.0", port=8000)
           PY
 
-      - name: Start API
-        run: python api.py &
+      - name: Start Flask API
+        run: |
+          nohup python api.py &
 
-      - name: Expose port 8000 with ngrok
-        uses: vmactions/ngrok-tunnel@v0.0.2     # any ngrok‑tunnel action works
-        with:
-          protocol: http
-          port: 8000
+      - name: Install ngrok and start tunnel
+        run: |
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install ngrok -y
+          ngrok config add-authtoken "$NGROK_TOKEN"
+          nohup ngrok http 8000 --log=stdout > ngrok.log &
+          sleep 5
+          curl --silent http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
 
-      - name: Keep runner alive for an hour
+      - name: Keep runner alive
         run: sleep 3600
