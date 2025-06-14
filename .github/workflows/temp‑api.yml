@@ -1,4 +1,4 @@
-name: realtime-chat-workflow
+name: realtime-chat-workflow-secured
 
 on:
   workflow_dispatch:
@@ -6,9 +6,16 @@ on:
 jobs:
   chat_application_server:
     runs-on: ubuntu-latest
+    # Restrict permissions for the GITHUB_TOKEN
+    permissions:
+      contents: read # Only needs to read the repository content
+
     env:
       NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      NGROK_USERNAME: ${{ secrets.NGROK_APP_USERNAME }} # For Basic Auth
+      NGROK_PASSWORD: ${{ secrets.NGROK_APP_PASSWORD }} # For Basic Auth
       LOG_LEVEL: INFO
+      FLASK_PORT: 8000
 
     steps:
     # 1. Checkout
@@ -22,16 +29,24 @@ jobs:
         python-version: '3.12'
 
     # 3. System deps
-    - name: Install jq & curl
+    - name: Install jq & curl & other utilities
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq curl unzip
+        # Pin versions for better security and reproducibility if specific versions are known good
+        # For this example, using latest, but in production, consider pinning.
+        sudo apt-get install -y jq curl unzip fuser
 
     # 4. Python deps
     - name: Install Python requirements
       run: |
         python -m pip install --upgrade pip
-        pip install flask flask-socketio eventlet
+        # Pin Python package versions for security and reproducibility
+        # Create a requirements.txt for a real project
+        pip install \
+          flask==3.0.3 \
+          flask-socketio==5.3.6 \
+          eventlet==0.35.2 \
+          gunicorn==22.0.0 # Recommended WSGI server for Flask
 
     # 5. Generate backend & frontend
     - name: Create application files
@@ -39,6 +54,9 @@ jobs:
         mkdir -p static
 
         # -------- api.py --------
+        # (Content from your original api.py, with a slight modification for Gunicorn)
+        # Note: I'll remove the `if __name__ == '__main__':` block's socketio.run
+        # because Gunicorn will handle running the app.
         cat <<'PY' | sed 's/^  //' > api.py
           import os, time, threading, logging
           from collections import deque
@@ -62,11 +80,17 @@ jobs:
 
           # --- Flask / Socket.IO ---
           app = Flask(__name__, static_folder='static', static_url_path='')
-          socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*")
+          # SECURITY: Restrict CORS to only necessary origins if known.
+          # For Ngrok, '*' is often used for dynamic URLs, but less secure.
+          # If Ngrok URL could be templated in, that'd be better.
+          # Consider adding a specific allowed origin if you use a fixed Ngrok domain.
+          socketio_origins = os.getenv("SOCKETIO_ALLOWED_ORIGINS", "*")
+          socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins=socketio_origins)
 
           chat_history = deque(maxlen=150)
           users = {}
           user_counter = 1
+          connected_clients = set() # To track actual connected sids more reliably
 
           @app.route('/')
           def index():
@@ -81,21 +105,24 @@ jobs:
           def on_connect():
               global user_counter
               sid = request.sid
+              connected_clients.add(sid)
               
-              # Check if this is a reconnection
-              if sid in users:
-                  name = users[sid]
-                  log.info("%s reconnected", name)
+              existing_name = users.get(sid)
+              if existing_name:
+                  name = existing_name # User reconnected with same sid session (rare for new browser tab)
+                  log.info("%s reconnected (sid: %s)", name, sid)
+                  # If we want to check if the user is truly "new" vs a quick reconnect:
+                  # Maybe a short timeout before announcing "left" could handle quick reconnections gracefully.
               else:
                   name = f"User-{user_counter}"
                   users[sid] = name
                   user_counter += 1
-                  log.info("%s connected", name)
+                  log.info("%s connected (sid: %s), assigned name: %s", request.remote_addr, sid, name)
+                  
+                  # Send welcome and user list
+                  emit('welcome', {'name': name, 'sid': sid}, to=sid)
+                  emit('user_list', [users[s] for s in connected_clients if s in users], broadcast=True)
 
-              emit('chat_history', list(chat_history), to=sid)
-
-              # Only send join message for new connections
-              if sid not in [u for u in users.keys() if u != sid]:
                   msg = {
                       "display_name": "System",
                       "text": f"{name} has joined",
@@ -103,14 +130,18 @@ jobs:
                       "type": "system_notification"
                   }
                   chat_history.append(msg)
-                  socketio.emit('new_message', msg)
+                  socketio.emit('new_message', msg, skip_sid=sid) # Don't send join to self, handle locally
+
+              emit('chat_history', list(chat_history), to=sid)
+
 
           @socketio.on('disconnect')
           def on_disconnect():
               sid = request.sid
-              if sid in users:
-                  name = users.pop(sid)
-                  log.info("%s disconnected", name)
+              connected_clients.discard(sid)
+              name = users.pop(sid, None) # Use pop with default to avoid KeyError
+              if name:
+                  log.info("%s disconnected (sid: %s)", name, sid)
 
                   msg = {
                       "display_name": "System",
@@ -120,16 +151,30 @@ jobs:
                   }
                   chat_history.append(msg)
                   socketio.emit('new_message', msg)
+                  socketio.emit('user_list', [users[s] for s in connected_clients if s in users], broadcast=True)
+              else:
+                  log.info("Unknown user with sid %s disconnected.", sid)
 
           @socketio.on('send_message')
           def on_send_message(data):
               sid = request.sid
-              if sid not in users:
+              name = users.get(sid)
+              if not name:
+                  log.warning("Message from unknown sid: %s, data: %s", sid, data)
+                  emit('error_message', {'text': 'You are not properly connected. Please refresh.'}, to=sid)
                   return
-              name = users[sid]
+
               text = (data or {}).get('text', '').strip()
-              if not text:
+              # SECURITY: Basic input sanitization/validation
+              if not text or len(text) > 1000: # Limit message length
+                  log.warning("Invalid message from %s: empty or too long.", name)
+                  emit('error_message', {'text': 'Message is empty or too long.'}, to=sid)
                   return
+
+              # Basic HTML escaping (though client-side should also handle rendering safely)
+              import html
+              text = html.escape(text)
+
               msg = {
                   "display_name": name,
                   "text": text,
@@ -141,26 +186,56 @@ jobs:
               socketio.emit('new_message', msg)
 
           # --- Tail api.log and broadcast lines ---
+          # This is for demo; in production, use a proper log aggregation system.
           def tail_logs():
+              log_file_path = 'api.log'
+              if not os.path.exists(log_file_path):
+                  with open(log_file_path, 'w') as lf: # Create if not exists
+                      lf.write("Log file created.\n")
+
               try:
-                  with open('api.log', 'r') as f:
-                      f.seek(0, 2)
+                  with open(log_file_path, 'r') as f:
+                      f.seek(0, 2) # Go to the end of the file
                       while True:
                           line = f.readline()
                           if line:
                               socketio.emit('server_log', {"line": line.rstrip()})
                           else:
-                              eventlet.sleep(1)
+                              eventlet.sleep(0.5) # Poll slightly less aggressively
               except Exception as e:
                   log.error("Log tail thread error: %s", e)
 
-          if __name__ == '__main__':
-              threading.Thread(target=tail_logs, daemon=True).start()
-              try:
-                  socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False)
-              except Exception as e:
-                  log.error("Startup failure: %s", e)
-                  raise
+          # For Gunicorn, the app object needs to be accessible.
+          # The threading.Thread for tail_logs will be started if __main__
+          # but for Gunicorn, it's better to manage this explicitly or use worker hooks.
+          # For simplicity here, we can start it if app is imported.
+          # However, a cleaner way with Gunicorn would be post_fork or when_ready server hooks.
+
+          # To ensure tail_logs starts with Gunicorn too:
+          _log_thread_started = False
+          def start_log_tailing_thread_if_not_started():
+              global _log_thread_started
+              if not _log_thread_started:
+                  # Check if we are in the main process (relevant for Gunicorn with multiple workers)
+                  # This check might be Gunicorn specific or not work as intended for all setups.
+                  # A Gunicorn `when_ready` hook is the most robust place.
+                  # For eventlet workers, each worker might start its own thread. This can be problematic
+                  # as each worker would read the log file. Better for one process to do this.
+                  # Given the setup, we'll let each worker try for simplicity of this example.
+                  threading.Thread(target=tail_logs, daemon=True).start()
+                  _log_thread_started = True
+                  log.info("Log tailing thread started.")
+
+          # Start it when this module is loaded. This will run for Gunicorn workers.
+          start_log_tailing_thread_if_not_started()
+
+          # Gunicorn will run `app` callable, not __main__ block
+          # if __name__ == '__main__':
+          #     try:
+          #         socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False)
+          #     except Exception as e:
+          #         log.error("Startup failure: %s", e)
+          #         raise
         PY
 
         # -------- static/index.html --------
@@ -170,11 +245,19 @@ jobs:
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Nexus Chat</title>
+            <!-- SECURITY: Content Security Policy -->
+            <meta http-equiv="Content-Security-Policy" 
+                  content="default-src 'self'; 
+                           script-src 'self' https://cdn.socket.io 'unsafe-eval'; 
+                           style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; 
+                           font-src 'self' https://fonts.gstatic.com;
+                           connect-src 'self' ws: wss:; 
+                           img-src 'self' data:;">
+            <title>Nexus Chat [Secure]</title>
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
             <style>
               :root {
-                --bg-primary: #0a0e1a;
+                --bg-primary: #0a0e1a; /* ... your existing styles ... */
                 --bg-secondary: #111827;
                 --bg-tertiary: #1f2937;
                 --bg-glass: rgba(17, 24, 39, 0.8);
@@ -188,420 +271,63 @@ jobs:
                 --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.3), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
                 --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
               }
-
-              * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-              }
-
-              body {
-                font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-                background: var(--bg-primary);
-                color: var(--text-primary);
-                overflow: hidden;
-                position: relative;
-              }
-
-              /* Animated background */
-              body::before {
-                content: '';
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: radial-gradient(circle at 20% 80%, rgba(59, 130, 246, 0.1) 0%, transparent 50%),
-                           radial-gradient(circle at 80% 20%, rgba(139, 92, 246, 0.1) 0%, transparent 50%),
-                           radial-gradient(circle at 40% 40%, rgba(16, 185, 129, 0.05) 0%, transparent 50%);
-                animation: pulse 8s ease-in-out infinite alternate;
-                z-index: -1;
-              }
-
-              @keyframes pulse {
-                0% { opacity: 0.3; }
-                100% { opacity: 0.6; }
-              }
-
-              .app-container {
-                height: 100vh;
-                display: flex;
-                flex-direction: column;
-                backdrop-filter: blur(10px);
-              }
-
-              /* Header */
-              .header {
-                background: var(--bg-glass);
-                backdrop-filter: blur(20px);
-                border-bottom: 1px solid var(--border-color);
-                padding: 1rem 2rem;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                position: relative;
-                z-index: 10;
-              }
-
-              .header::before {
-                content: '';
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                height: 1px;
-                background: var(--accent-gradient);
-                opacity: 0.5;
-              }
-
-              .logo {
-                font-size: 1.5rem;
-                font-weight: 700;
-                background: var(--accent-gradient);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                background-clip: text;
-                display: flex;
-                align-items: center;
-                gap: 0.5rem;
-              }
-
-              .logo::before {
-                content: '◆';
-                font-size: 1.2rem;
-                animation: rotate 3s linear infinite;
-              }
-
-              @keyframes rotate {
-                from { transform: rotate(0deg); }
-                to { transform: rotate(360deg); }
-              }
-
-              .status-indicator {
-                display: flex;
-                align-items: center;
-                gap: 0.5rem;
-                font-size: 0.875rem;
-                font-weight: 500;
-              }
-
-              .status-dot {
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-                background: #ef4444;
-                animation: blink 2s infinite;
-              }
-
-              .status-dot.connected {
-                background: #10b981;
-                animation: none;
-              }
-
-              @keyframes blink {
-                0%, 50% { opacity: 1; }
-                51%, 100% { opacity: 0.3; }
-              }
-
-              /* Main content */
-              .main-content {
-                flex: 1;
-                display: grid;
-                grid-template-columns: 2fr 1fr;
-                gap: 1px;
-                background: var(--border-color);
-                overflow: hidden;
-                min-height: 0; /* Critical for proper flex behavior */
-              }
-
-              .panel {
-                background: var(--bg-secondary);
-                display: flex;
-                flex-direction: column;
-                position: relative;
-                height: 100%;
-                min-height: 0; /* Important for flex containers */
-              }
-
-              .panel-header {
-                background: var(--bg-tertiary);
-                padding: 1rem 1.5rem;
-                font-weight: 600;
-                font-size: 0.875rem;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                color: var(--text-secondary);
-                border-bottom: 1px solid var(--border-color);
-                flex-shrink: 0; /* Prevent header from shrinking */
-              }
-
-              /* Chat Panel */
-              .chat-messages {
-                flex: 1;
-                overflow-y: auto;
-                overflow-x: hidden;
-                padding: 1.5rem;
-                display: flex;
-                flex-direction: column;
-                gap: 1rem;
-                scroll-behavior: smooth;
-                min-width: 0; /* Prevents flex item from overflowing */
-                min-height: 0; /* Critical for scrolling in flex containers */
-              }
-
-              .chat-messages::-webkit-scrollbar {
-                width: 6px;
-              }
-
-              .chat-messages::-webkit-scrollbar-track {
-                background: transparent;
-              }
-
-              .chat-messages::-webkit-scrollbar-thumb {
-                background: var(--border-color);
-                border-radius: 3px;
-              }
-
-              .message-bubble {
-                max-width: 70%;
-                min-width: 100px;
-                padding: 0.875rem 1.25rem;
-                border-radius: 1.25rem;
-                position: relative;
-                animation: messageIn 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-                word-wrap: break-word;
-                word-break: break-word;
-                overflow-wrap: break-word;
-                hyphens: auto;
-              }
-
-              @keyframes messageIn {
-                from {
-                  opacity: 0;
-                  transform: translateY(20px) scale(0.9);
-                }
-                to {
-                  opacity: 1;
-                  transform: translateY(0) scale(1);
-                }
-              }
-
-              .message-bubble.self {
-                align-self: flex-end;
-                background: var(--accent-gradient);
-                color: white;
-                border-bottom-right-radius: 0.5rem;
-              }
-
-              .message-bubble.other {
-                align-self: flex-start;
-                background: var(--bg-tertiary);
-                border-bottom-left-radius: 0.5rem;
-                border: 1px solid var(--border-color);
-              }
-
-              .message-bubble.system {
-                align-self: center;
-                background: rgba(139, 92, 246, 0.1);
-                border: 1px solid rgba(139, 92, 246, 0.3);
-                color: var(--text-muted);
-                font-style: italic;
-                font-size: 0.875rem;
-                border-radius: 2rem;
-                max-width: 85%;
-                text-align: center;
-              }
-
-              .message-meta {
-                font-size: 0.75rem;
-                opacity: 0.7;
-                margin-bottom: 0.25rem;
-                font-weight: 500;
-              }
-
-              .message-text {
-                line-height: 1.5;
-                white-space: pre-wrap;
-                overflow-wrap: break-word;
-                word-break: break-word;
-              }
-
-              /* Message input */
-              .message-input-container {
-                padding: 1.5rem;
-                background: var(--bg-tertiary);
-                border-top: 1px solid var(--border-color);
-                flex-shrink: 0; /* Prevent input area from shrinking */
-              }
-
-              .message-form {
-                display: flex;
-                gap: 1rem;
-                align-items: flex-end;
-              }
-
-              .input-wrapper {
-                flex: 1;
-                position: relative;
-              }
-
-              .message-input {
-                width: 100%;
-                background: var(--bg-secondary);
-                border: 2px solid var(--border-color);
-                border-radius: 1.5rem;
-                padding: 1rem 1.5rem;
-                color: var(--text-primary);
-                font-size: 0.9375rem;
-                resize: none;
-                outline: none;
-                transition: all 0.2s ease;
-                font-family: inherit;
-              }
-
-              .message-input:focus {
-                border-color: var(--accent-primary);
-                box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-              }
-
-              .send-button {
-                background: var(--accent-gradient);
-                border: none;
-                width: 48px;
-                height: 48px;
-                border-radius: 50%;
-                color: white;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                transition: all 0.2s ease;
-                font-size: 1.25rem;
-                box-shadow: var(--shadow-lg);
-              }
-
-              .send-button:hover {
-                transform: translateY(-2px);
-                box-shadow: var(--shadow-xl);
-              }
-
-              .send-button:active {
-                transform: translateY(0);
-              }
-
-              .send-button:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
-                transform: none;
-              }
-
-              /* Logs Panel */
-              .logs-container {
-                flex: 1;
-                overflow-y: auto;
-                overflow-x: hidden;
-                padding: 1rem;
-                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-                font-size: 0.8125rem;
-                line-height: 1.4;
-                background: #0d1117;
-                min-height: 0; /* Critical for scrolling in flex containers */
-              }
-
-              .logs-container::-webkit-scrollbar {
-                width: 6px;
-              }
-
-              .logs-container::-webkit-scrollbar-track {
-                background: transparent;
-              }
-
-              .logs-container::-webkit-scrollbar-thumb {
-                background: var(--border-color);
-                border-radius: 3px;
-              }
-
-              .log-line {
-                margin-bottom: 0.25rem;
-                color: #8b949e;
-                animation: logIn 0.2s ease-out;
-              }
-
-              @keyframes logIn {
-                from {
-                  opacity: 0;
-                  transform: translateX(-10px);
-                }
-                to {
-                  opacity: 1;
-                  transform: translateX(0);
-                }
-              }
-
-              /* Responsive design */
-              @media (max-width: 1024px) {
-                .main-content {
-                  grid-template-columns: 1fr;
-                  grid-template-rows: 2fr 1fr;
-                }
-              }
-
-              @media (max-width: 768px) {
-                .header {
-                  padding: 1rem;
-                }
-                
-                .logo {
-                  font-size: 1.25rem;
-                }
-                
-                .message-bubble {
-                  max-width: 85%;
-                }
-                
-                .message-input-container {
-                  padding: 1rem;
-                }
-                
-                .chat-messages {
-                  padding: 1rem;
-                }
-              }
-
-              /* Loading animation */
-              .loading-dots {
-                display: inline-flex;
-                gap: 2px;
-              }
-
-              .loading-dots span {
-                width: 4px;
-                height: 4px;
-                border-radius: 50%;
-                background: currentColor;
-                animation: loadingDot 1.4s infinite both;
-              }
-
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg-primary); color: var(--text-primary); overflow: hidden; position: relative; }
+              body::before { content: ''; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: radial-gradient(circle at 20% 80%, rgba(59, 130, 246, 0.1) 0%, transparent 50%), radial-gradient(circle at 80% 20%, rgba(139, 92, 246, 0.1) 0%, transparent 50%), radial-gradient(circle at 40% 40%, rgba(16, 185, 129, 0.05) 0%, transparent 50%); animation: pulse 8s ease-in-out infinite alternate; z-index: -1; }
+              @keyframes pulse { 0% { opacity: 0.3; } 100% { opacity: 0.6; } }
+              .app-container { height: 100vh; display: flex; flex-direction: column; backdrop-filter: blur(10px); }
+              .header { background: var(--bg-glass); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); padding: 1rem 2rem; display: flex; align-items: center; justify-content: space-between; position: relative; z-index: 10; }
+              .header::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: var(--accent-gradient); opacity: 0.5; }
+              .logo { font-size: 1.5rem; font-weight: 700; background: var(--accent-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; display: flex; align-items: center; gap: 0.5rem; }
+              .logo::before { content: '◆'; font-size: 1.2rem; animation: rotate 3s linear infinite; }
+              @keyframes rotate { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+              .status-indicator { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; font-weight: 500; }
+              .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; animation: blink 2s infinite; }
+              .status-dot.connected { background: #10b981; animation: none; }
+              @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0.3; } }
+              .main-content { flex: 1; display: grid; grid-template-columns: 2fr 1fr; gap: 1px; background: var(--border-color); overflow: hidden; min-height: 0; }
+              .panel { background: var(--bg-secondary); display: flex; flex-direction: column; position: relative; height: 100%; min-height: 0; }
+              .panel-header { background: var(--bg-tertiary); padding: 1rem 1.5rem; font-weight: 600; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); border-bottom: 1px solid var(--border-color); flex-shrink: 0; }
+              .chat-messages { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 1.5rem; display: flex; flex-direction: column; gap: 1rem; scroll-behavior: smooth; min-width: 0; min-height: 0; }
+              .chat-messages::-webkit-scrollbar { width: 6px; }
+              .chat-messages::-webkit-scrollbar-track { background: transparent; }
+              .chat-messages::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+              .message-bubble { max-width: 70%; min-width: 100px; padding: 0.875rem 1.25rem; border-radius: 1.25rem; position: relative; animation: messageIn 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55); word-wrap: break-word; word-break: break-word; overflow-wrap: break-word; hyphens: auto; }
+              @keyframes messageIn { from { opacity: 0; transform: translateY(20px) scale(0.9); } to { opacity: 1; transform: translateY(0) scale(1); } }
+              .message-bubble.self { align-self: flex-end; background: var(--accent-gradient); color: white; border-bottom-right-radius: 0.5rem; }
+              .message-bubble.other { align-self: flex-start; background: var(--bg-tertiary); border-bottom-left-radius: 0.5rem; border: 1px solid var(--border-color); }
+              .message-bubble.system { align-self: center; background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.3); color: var(--text-muted); font-style: italic; font-size: 0.875rem; border-radius: 2rem; max-width: 85%; text-align: center; }
+              .message-meta { font-size: 0.75rem; opacity: 0.7; margin-bottom: 0.25rem; font-weight: 500; }
+              .message-text { line-height: 1.5; white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word; }
+              .message-input-container { padding: 1.5rem; background: var(--bg-tertiary); border-top: 1px solid var(--border-color); flex-shrink: 0; }
+              .message-form { display: flex; gap: 1rem; align-items: flex-end; }
+              .input-wrapper { flex: 1; position: relative; }
+              .message-input { width: 100%; background: var(--bg-secondary); border: 2px solid var(--border-color); border-radius: 1.5rem; padding: 1rem 1.5rem; color: var(--text-primary); font-size: 0.9375rem; resize: none; outline: none; transition: all 0.2s ease; font-family: inherit; }
+              .message-input:focus { border-color: var(--accent-primary); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+              .send-button { background: var(--accent-gradient); border: none; width: 48px; height: 48px; border-radius: 50%; color: white; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s ease; font-size: 1.25rem; box-shadow: var(--shadow-lg); }
+              .send-button:hover { transform: translateY(-2px); box-shadow: var(--shadow-xl); }
+              .send-button:active { transform: translateY(0); }
+              .send-button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+              .logs-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 1rem; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; font-size: 0.8125rem; line-height: 1.4; background: #0d1117; min-height: 0; }
+              .logs-container::-webkit-scrollbar { width: 6px; }
+              .logs-container::-webkit-scrollbar-track { background: transparent; }
+              .logs-container::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+              .log-line { margin-bottom: 0.25rem; color: #8b949e; animation: logIn 0.2s ease-out; }
+              @keyframes logIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
+              @media (max-width: 1024px) { .main-content { grid-template-columns: 1fr; grid-template-rows: 2fr 1fr; } }
+              @media (max-width: 768px) { .header { padding: 1rem; } .logo { font-size: 1.25rem; } .message-bubble { max-width: 85%; } .message-input-container { padding: 1rem; } .chat-messages { padding: 1rem; } }
+              .loading-dots { display: inline-flex; gap: 2px; }
+              .loading-dots span { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: loadingDot 1.4s infinite both; }
               .loading-dots span:nth-child(1) { animation-delay: 0s; }
               .loading-dots span:nth-child(2) { animation-delay: 0.2s; }
               .loading-dots span:nth-child(3) { animation-delay: 0.4s; }
-
-              @keyframes loadingDot {
-                0%, 80%, 100% {
-                  transform: scale(0.8);
-                  opacity: 0.5;
-                }
-                40% {
-                  transform: scale(1);
-                  opacity: 1;
-                }
-              }
+              @keyframes loadingDot { 0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; } 40% { transform: scale(1); opacity: 1; } }
             </style>
           </head>
           <body>
             <div class="app-container">
               <header class="header">
-                <div class="logo">Nexus Chat</div>
+                <div class="logo">Nexus Chat [Secure]</div>
                 <div class="status-indicator">
                   <div class="status-dot" id="statusDot"></div>
                   <span id="statusText">Connecting<span class="loading-dots"><span></span><span></span><span></span></span></span>
@@ -610,7 +336,7 @@ jobs:
 
               <main class="main-content">
                 <div class="panel">
-                  <div class="panel-header">Chat Room</div>
+                  <div class="panel-header">Chat Room <span id="myName" style="font-weight:normal; font-style:italic;"></span></div>
                   <div class="chat-messages" id="chatMessages"></div>
                   <div class="message-input-container">
                     <form class="message-form" id="messageForm">
@@ -631,15 +357,22 @@ jobs:
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header">Server Logs</div>
-                  <div class="logs-container" id="logsContainer"></div>
+                  <div class="panel-header">Server Logs & Users (<span id="userCount">0</span>)</div>
+                  <div class="logs-container" id="logsContainerWrapper">
+                     <div id="userList" style="padding: 0.5rem; border-bottom: 1px solid var(--border-color); margin-bottom:0.5rem; color: var(--text-secondary)">Users: </div>
+                     <div class="logs-container" id="logsContainer"></div>
+                  </div>
                 </div>
               </main>
             </div>
 
             <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
             <script>
-              const socket = io();
+              // For CSP 'unsafe-eval' for Socket.IO if needed by older browsers/configs
+              // Current Socket.IO versions are generally CSP-friendly, but good to be aware
+              // Using Socket.IO version 4.7.5 which should be fine without 'unsafe-eval' generally
+              const socket = io({ autoConnect: false }); // Don't auto-connect, allows for auth if needed later
+
               const statusDot = document.getElementById('statusDot');
               const statusText = document.getElementById('statusText');
               const chatMessages = document.getElementById('chatMessages');
@@ -647,15 +380,21 @@ jobs:
               const messageForm = document.getElementById('messageForm');
               const messageInput = document.getElementById('messageInput');
               const sendButton = document.getElementById('sendButton');
-              let currentUser = '';
+              const myNameDisplay = document.getElementById('myName');
+              const userListDisplay = document.getElementById('userList');
+              const userCountDisplay = document.getElementById('userCount');
+              
+              let myAssignedName = ''; // Store the name assigned by the server
+
+              // Connect to socket
+              socket.connect();
 
               // Auto-resize textarea
               messageInput.addEventListener('input', function() {
                 this.style.height = 'auto';
-                this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+                this.style.height = Math.min(this.scrollHeight, 120) + 'px'; // Max 120px height
               });
 
-              // Handle Enter key (Shift+Enter for new line)
               messageInput.addEventListener('keydown', function(e) {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
@@ -664,26 +403,40 @@ jobs:
               });
 
               const scrollToBottom = (element) => {
-                element.scrollTop = element.scrollHeight;
+                // Only scroll if user is near the bottom already, to avoid disrupting reading
+                const threshold = 50; // pixels
+                if (element.scrollHeight - element.scrollTop - element.clientHeight < threshold) {
+                    element.scrollTop = element.scrollHeight;
+                }
               };
 
+              // Sanitize text before displaying (defense in depth)
+              function sanitizeHTML(text) {
+                  const temp = document.createElement('div');
+                  temp.textContent = text;
+                  return temp.innerHTML;
+              }
+              
               const addMessage = (message) => {
                 const messageDiv = document.createElement('div');
                 const isSystem = message.type === 'system_notification';
-                const isSelf = message.display_name === currentUser && !isSystem;
+                // Use the server-assigned name for "self" check
+                const isSelf = message.display_name === myAssignedName && !isSystem && myAssignedName !== '';
                 
-                messageDiv.className = `message-bubble ${isSystem ? 'system' : (isSelf ? 'self' : 'other')}`;
+                messageDiv.className = \`message-bubble \${isSystem ? 'system' : (isSelf ? 'self' : 'other')}\`;
                 
                 if (!isSystem) {
                   const metaDiv = document.createElement('div');
                   metaDiv.className = 'message-meta';
-                  metaDiv.textContent = `${message.display_name} • ${message.timestamp}`;
+                  // Use sanitized display name
+                  metaDiv.textContent = \`\${sanitizeHTML(message.display_name)} • \${message.timestamp}\`;
                   messageDiv.appendChild(metaDiv);
                 }
                 
                 const textDiv = document.createElement('div');
                 textDiv.className = 'message-text';
-                textDiv.textContent = message.text;
+                // Sanitize message text as well
+                textDiv.textContent = message.text; // Server already escaped, but client-side textContent is safest
                 messageDiv.appendChild(textDiv);
                 
                 chatMessages.appendChild(messageDiv);
@@ -693,31 +446,63 @@ jobs:
               const addLog = (line) => {
                 const logDiv = document.createElement('div');
                 logDiv.className = 'log-line';
-                logDiv.textContent = line;
+                logDiv.textContent = line; // Logs are usually pre-formatted, treat as plain text
                 logsContainer.appendChild(logDiv);
                 scrollToBottom(logsContainer);
                 
-                // Keep only last 100 log lines
-                while (logsContainer.children.length > 100) {
+                while (logsContainer.children.length > 200) { // Limit log lines on client
                   logsContainer.removeChild(logsContainer.firstChild);
                 }
               };
 
-              // Socket event handlers
               socket.on('connect', () => {
                 statusDot.classList.add('connected');
                 statusText.textContent = 'Connected';
                 messageInput.disabled = false;
                 sendButton.disabled = false;
-                console.log('Socket connected');
+                console.log('Socket connected: ' + socket.id);
               });
 
-              socket.on('disconnect', () => {
+              socket.on('disconnect', (reason) => {
                 statusDot.classList.remove('connected');
                 statusText.innerHTML = 'Disconnected <span class="loading-dots"><span></span><span></span><span></span></span>';
                 messageInput.disabled = true;
                 sendButton.disabled = true;
-                console.log('Socket disconnected');
+                console.log('Socket disconnected: ' + reason);
+                myNameDisplay.textContent = '';
+                myAssignedName = '';
+                // Optionally, add a reconnect attempt mechanism here
+              });
+
+              socket.on('connect_error', (err) => {
+                console.error("Connection Error:", err.message, err.data);
+                statusText.textContent = 'Connection Failed';
+                addLog(\`Client connection error: \${err.message}\`);
+              });
+
+              socket.on('welcome', (data) => {
+                  myAssignedName = data.name;
+                  myNameDisplay.textContent = \`(Me: \${sanitizeHTML(myAssignedName)})\`;
+                  console.log(\`Welcome! Server assigned name: \${myAssignedName}, SID: \${data.sid}\`);
+                  // If join message was sent to self by server, this can help identify it
+              });
+
+              socket.on('user_list', (users) => {
+                  userListDisplay.innerHTML = 'Users: '; // Clear previous
+                  const userElements = users.map(name => {
+                      const span = document.createElement('span');
+                      span.textContent = sanitizeHTML(name);
+                      if (name === myAssignedName) {
+                          span.style.fontWeight = 'bold';
+                      }
+                      return span;
+                  });
+                  userListDisplay.append(...userElements.reduce((acc, curr, idx) => {
+                      if (idx > 0) acc.push(document.createTextNode(', '));
+                      acc.push(curr);
+                      return acc;
+                  }, []));
+                  userCountDisplay.textContent = users.length;
               });
 
               socket.on('chat_history', (history) => {
@@ -726,9 +511,6 @@ jobs:
               });
 
               socket.on('new_message', (message) => {
-                if (!currentUser && message.type === 'user_message') {
-                  currentUser = message.display_name;
-                }
                 addMessage(message);
               });
 
@@ -736,41 +518,71 @@ jobs:
                 addLog(data.line);
               });
 
-              // Form submission
+              socket.on('error_message', (data) => {
+                // Display error messages from server (e.g., message too long)
+                // You could use a more prominent way to show these.
+                addLog(\`Server error: \${data.text}\`);
+                alert(\`Server: \${data.text}\`);
+              });
+
               messageForm.addEventListener('submit', (e) => {
                 e.preventDefault();
                 const text = messageInput.value.trim();
                 if (text && !messageInput.disabled) {
                   socket.emit('send_message', { text });
                   messageInput.value = '';
-                  messageInput.style.height = 'auto';
+                  messageInput.style.height = 'auto'; // Reset height
+                  messageInput.focus();
                 }
               });
+
             </script>
           </body>
           </html>
         HTML
 
-    # 6. Start backend
-    - name: Launch Python chat server
+    # 6. Start backend with Gunicorn
+    - name: Launch Python chat server with Gunicorn
       run: |
-        nohup python api.py > api.log 2>&1 &
-        echo $! > python.pid
-        sleep 8
+        # Use Gunicorn for a more robust WSGI server
+        # eventlet worker is necessary for flask-socketio
+        nohup gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:${FLASK_PORT} api:app > app_server.log 2>&1 &
+        echo $! > gunicorn.pid
+        sleep 8 # Give it time to start
 
         # Health‑check 1: process alive?
-        if ! kill -0 "$(cat python.pid)"; then
-          echo "Python process exited:"
-          cat api.log
+        if ! kill -0 "$(cat gunicorn.pid)"; then
+          echo "Gunicorn process exited:"
+          cat app_server.log || echo "app_server.log not found"
+          cat api.log || echo "api.log not found"
           exit 1
         fi
 
         # Health‑check 2: /ping
-        curl -s http://localhost:8000/ping || true
+        # Use --fail to make curl exit with an error if HTTP status is >= 400
+        if ! curl -s --fail http://localhost:${FLASK_PORT}/ping; then
+            echo "Gunicorn /ping endpoint failed:"
+            cat app_server.log || echo "app_server.log not found"
+            cat api.log || echo "api.log not found"
+            exit 1
+        fi
+        echo "Gunicorn server started successfully."
 
-    # 7. Ngrok tunnel
-    - name: Start ngrok tunnel
+    # 7. Ngrok tunnel with Basic Authentication
+    - name: Start ngrok tunnel with Basic Auth
+      id: ngrok_tunnel # Give this step an id to access its outputs
       run: |
+        if [[ -z "$NGROK_USERNAME" || -z "$NGROK_PASSWORD" ]]; then
+          echo "::error::NGROK_APP_USERNAME and NGROK_APP_PASSWORD secrets are not set. Tunnel will be insecure."
+          # Potentially exit 1 here if you want to enforce auth
+          # exit 1 
+          AUTH_PARAM=""
+        else
+          # SECURITY: Add Basic Authentication to the Ngrok tunnel
+          AUTH_PARAM="--basic-auth \"$NGROK_USERNAME:$NGROK_PASSWORD\""
+          echo "Ngrok Basic Authentication is configured."
+        fi
+
         # Install ngrok
         curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
         echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
@@ -779,33 +591,124 @@ jobs:
 
         # Auth & run
         ngrok config add-authtoken "$NGROK_TOKEN"
-        nohup ngrok http 8000 --log=stdout --log-level=debug > ngrok.log 2>&1 &
+        # SECURITY: Log to a specific file, set log level for debugging if needed but be mindful of sensitive info.
+        # Use --domain if you have a custom reserved domain with Ngrok for stable URLs & better security policy.
+        # The `eval` is used here to correctly interpret the AUTH_PARAM string with quotes. Be cautious with eval.
+        eval "nohup ngrok http ${FLASK_PORT} --log=stdout --log-level=info $AUTH_PARAM > ngrok.log 2>&1 &"
         echo $! > ngrok.pid
 
         # Wait & fetch public URL
-        for i in {1..5}; do
-          sleep 3
-          URL=$(curl -s http://localhost:4040/api/tunnels \
-            | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)
-          if [ -n "$URL" ]; then
-            echo "🚀 Ngrok Public URL: $URL"
+        PUBLIC_URL=""
+        for i in {1..10}; do # Increased retries and wait time
+          sleep 5
+          # Attempt to get HTTPS tunnel first, then HTTP if HTTPS not found
+          TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https" and .config.addr=="http://localhost:'"${FLASK_PORT}"'") | .public_url' | head -n1)
+          if [ -z "$TUNNEL_URL" ]; then
+             TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="http" and .config.addr=="http://localhost:'"${FLASK_PORT}"'") | .public_url' | head -n1)
+          fi
+
+          if [ -n "$TUNNEL_URL" ]; then
+            PUBLIC_URL=$TUNNEL_URL
+            echo "🚀 Ngrok Public URL: $PUBLIC_URL"
+            echo "NGROK_URL=$PUBLIC_URL" >> $GITHUB_OUTPUT # Set output for other steps/jobs
             break
+          else
+            echo "Waiting for Ngrok tunnel... attempt $i"
+            # Show recent ngrok log if failing to find URL
+            if [ -f ngrok.log ]; then tail -n 5 ngrok.log; fi
           fi
         done
 
-        if [ -z "$URL" ]; then
-          echo "Could not obtain ngrok URL"
-          tail -n 50 ngrok.log || true
-          tail -n 50 api.log   || true
+        if [ -z "$PUBLIC_URL" ]; then
+          echo "::error::Could not obtain ngrok URL after multiple attempts."
+          tail -n 50 ngrok.log || echo "ngrok.log not found"
+          tail -n 50 app_server.log || echo "app_server.log not found"
+          tail -n 50 api.log || echo "api.log not found"
           exit 1
         fi
 
-    # 8. Show logs & keep runner alive
+    # 8. Show logs & keep runner alive (shortened for testing, extend as needed)
     - name: Tail logs and keep runner up
       run: |
-        echo "===== api.log (last 50) ====="
+        echo "=========================================="
+        echo "Chat application is live at: ${{ steps.ngrok_tunnel.outputs.NGROK_URL }}"
+        echo "If Basic Auth is enabled, use credentials from NGROK_APP_USERNAME/PASSWORD secrets."
+        echo "=========================================="
+        echo "View initial server logs:"
+        echo "===== app_server.log (Gunicorn - last 20) ====="
+        tail -n 20 app_server.log || true
+        echo "===== api.log (Flask app - last 50) ====="
         tail -n 50 api.log || true
         echo "===== ngrok.log (last 20) ====="
         tail -n 20 ngrok.log || true
-        echo "Runner sleeping for manual testing. Open dev‑console for client logs."
-        sleep 3600
+        
+        echo "Runner will stay alive for testing. Access the URL above."
+        echo "Logs will be continuously tailed below. Ctrl+C in workflow run to stop."
+        
+        # Start a loop that tails logs and sleeps.
+        # This will keep the step running.
+        end_time=$((SECONDS + 3600)) # Keep alive for 1 hour
+        echo "Keeping runner alive until $(date -d @$end_time)"
+
+        # Tail logs in the background, then wait
+        tail -f api.log app_server.log ngrok.log &
+        TAIL_PID=$!
+
+        while [ $SECONDS -lt $end_time ]; do
+          if ! kill -0 $TAIL_PID 2>/dev/null; then
+            echo "Log tailing process died. Exiting."
+            break
+          fi
+          # Check if Ngrok or Gunicorn died
+          if ! kill -0 "$(cat ngrok.pid 2>/dev/null)" 2>/dev/null; then
+            echo "Ngrok process died. Exiting."
+            break
+          fi
+          if ! kill -0 "$(cat gunicorn.pid 2>/dev/null)" 2>/dev/null; then
+            echo "Gunicorn process died. Exiting."
+            break
+          fi
+          sleep 60
+        done
+        
+        echo "Sleep time finished or a critical process died. Exiting keep-alive step."
+        # Kill the tail process explicitly if it's still running
+        kill $TAIL_PID 2>/dev/null || true
+
+    # 9. Cleanup step (runs even if previous steps fail or are cancelled)
+    - name: Cleanup processes
+      if: always() # Ensures this step runs regardless of job status
+      run: |
+        echo "Cleaning up background processes..."
+        # Stop Gunicorn (sends SIGTERM, then SIGKILL after timeout)
+        if [ -f gunicorn.pid ]; then
+          echo "Stopping Gunicorn server (PID $(cat gunicorn.pid))..."
+          kill "$(cat gunicorn.pid)" 2>/dev/null || echo "Gunicorn already stopped."
+          # Alternative, more forceful kill if needed:
+          # sudo fuser -k ${FLASK_PORT}/tcp || echo "Port ${FLASK_PORT} not in use or fuser failed."
+          rm -f gunicorn.pid
+        else
+          echo "Gunicorn PID file not found."
+          # Fallback: kill processes using the port, be careful with this
+          # sudo fuser -k ${FLASK_PORT}/tcp || echo "Attempt to kill by port ${FLASK_PORT}."
+        fi
+
+        # Stop ngrok
+        if [ -f ngrok.pid ]; then
+          echo "Stopping ngrok (PID $(cat ngrok.pid))..."
+          kill "$(cat ngrok.pid)" 2>/dev/null || echo "Ngrok already stopped."
+          # More forceful: pkill -f "ngrok http ${FLASK_PORT}"
+          rm -f ngrok.pid
+        else
+          echo "Ngrok PID file not found."
+        fi
+
+        # Give a moment for processes to terminate
+        sleep 5
+        echo "Cleanup finished."
+        echo "Final Gunicorn log:"
+        tail -n 20 app_server.log || true
+        echo "Final api.log:"
+        tail -n 20 api.log || true
+        echo "Final ngrok log:"
+        tail -n 20 ngrok.log || true
