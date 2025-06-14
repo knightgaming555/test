@@ -11,31 +11,34 @@ jobs:
       LOG_LEVEL: INFO
 
     steps:
-    # ─────────────────────────────── git & python ───────────────────────────────
-    - name: Checkout
+    # 1. Checkout
+    - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Set up Python 3.12
+    # 2. Python 3.12
+    - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
-    - name: System packages
+    # 3. System deps
+    - name: Install jq & curl
       run: |
         sudo apt-get update
         sudo apt-get install -y jq curl unzip
 
-    - name: Python packages
+    # 4. Python deps
+    - name: Install Python requirements
       run: |
         python -m pip install --upgrade pip
         pip install flask flask-socketio eventlet
 
-    # ────────────────────────────── generate files ──────────────────────────────
-    - name: Create backend & frontend
+    # 5. Generate backend & frontend
+    - name: Create application files
       run: |
         mkdir -p static
 
-        # ───── api.py ─────
+        # -------- api.py --------
         cat <<'PY' | sed 's/^  //' > api.py
           import os, time, threading, logging
           from collections import deque
@@ -45,21 +48,25 @@ jobs:
           from flask import Flask, jsonify, send_from_directory, request
           from flask_socketio import SocketIO, emit
 
-          # ── logging ──
+          # --- logging ---
           LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
           logging.basicConfig(
               level=LOG_LEVEL,
               format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-              handlers=[logging.FileHandler("api.log"), logging.StreamHandler()]
+              handlers=[
+                  logging.FileHandler("api.log"),
+                  logging.StreamHandler()
+              ]
           )
           log = logging.getLogger("chat_app")
 
-          # ── flask / socket.io ──
+          # --- Flask / Socket.IO ---
           app = Flask(__name__, static_folder='static', static_url_path='')
           socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*")
 
-          chat_history = deque(maxlen=150)   # last 150 messages
-          users = {}                         # sid -> display_name
+          chat_history = deque(maxlen=150)
+          users = {}
+          user_counter = 1
 
           @app.route('/')
           def index():
@@ -69,44 +76,57 @@ jobs:
           def ping():
               return jsonify(ok=True, message="Pong!")
 
-          def make_system(text):
-              return {
-                  "display_name": "System",
-                  "text": text,
-                  "timestamp": time.strftime("%H:%M:%S"),
-                  "type": "system_notification"
-              }
-
-          # ── socket events ──
+          # ---- Socket.IO events ----
           @socketio.on('connect')
           def on_connect():
+              global user_counter
               sid = request.sid
-              supplied = request.args.get('name') or ''
-              name = supplied if supplied else f"User-{sid[:5]}"
-              users[sid] = name
-              log.info("%s connected", name)
+              
+              # Check if this is a reconnection
+              if sid in users:
+                  name = users[sid]
+                  log.info("%s reconnected", name)
+              else:
+                  name = f"User-{user_counter}"
+                  users[sid] = name
+                  user_counter += 1
+                  log.info("%s connected", name)
 
-              emit('your_name', name, to=sid)
               emit('chat_history', list(chat_history), to=sid)
 
-              msg = make_system(f"{name} has joined")
-              chat_history.append(msg)
-              socketio.emit('new_message', msg)
+              # Only send join message for new connections
+              if sid not in [u for u in users.keys() if u != sid]:
+                  msg = {
+                      "display_name": "System",
+                      "text": f"{name} has joined",
+                      "timestamp": time.strftime("%H:%M:%S"),
+                      "type": "system_notification"
+                  }
+                  chat_history.append(msg)
+                  socketio.emit('new_message', msg)
 
           @socketio.on('disconnect')
           def on_disconnect():
               sid = request.sid
-              name = users.pop(sid, f"User-{sid[:5]}")
-              log.info("%s disconnected", name)
+              if sid in users:
+                  name = users.pop(sid)
+                  log.info("%s disconnected", name)
 
-              msg = make_system(f"{name} has left")
-              chat_history.append(msg)
-              socketio.emit('new_message', msg)
+                  msg = {
+                      "display_name": "System",
+                      "text": f"{name} has left",
+                      "timestamp": time.strftime("%H:%M:%S"),
+                      "type": "system_notification"
+                  }
+                  chat_history.append(msg)
+                  socketio.emit('new_message', msg)
 
           @socketio.on('send_message')
           def on_send_message(data):
               sid = request.sid
-              name = users.get(sid, f"User-{sid[:5]}")
+              if sid not in users:
+                  return
+              name = users[sid]
               text = (data or {}).get('text', '').strip()
               if not text:
                   return
@@ -120,7 +140,7 @@ jobs:
               log.info("Message from %s: %s", name, text)
               socketio.emit('new_message', msg)
 
-          # ── tail api.log and push lines ──
+          # --- Tail api.log and broadcast lines ---
           def tail_logs():
               try:
                   with open('api.log', 'r') as f:
@@ -136,234 +156,648 @@ jobs:
 
           if __name__ == '__main__':
               threading.Thread(target=tail_logs, daemon=True).start()
-              socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False)
+              try:
+                  socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False)
+              except Exception as e:
+                  log.error("Startup failure: %s", e)
+                  raise
         PY
 
-        # ───── static/index.html ─────
+        # -------- static/index.html --------
         cat <<'HTML' | sed 's/^  //' > static/index.html
           <!DOCTYPE html>
           <html lang="en">
           <head>
             <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width,initial-scale=1.0">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Nexus Chat</title>
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
             <style>
-              :root{
-                --bg-1:#0a0e1a;--bg-2:#111827;--bg-3:#1f2937;
-                --accent-1:#3b82f6;--accent-2:#8b5cf6;
-                --grad:linear-gradient(135deg,#3b82f6,#8b5cf6);
-                --text-1:#f9fafb;--text-2:#d1d5db;--text-muted:#9ca3af;
-                --border:rgba(75,85,99,.3);
-                --shadow-lg:0 20px 25px -5px rgba(0,0,0,.3),0 10px 10px -5px rgba(0,0,0,.1);
-                --shadow-xl:0 25px 50px -12px rgba(0,0,0,.5);
+              :root {
+                --bg-primary: #0a0e1a;
+                --bg-secondary: #111827;
+                --bg-tertiary: #1f2937;
+                --bg-glass: rgba(17, 24, 39, 0.8);
+                --accent-primary: #3b82f6;
+                --accent-secondary: #8b5cf6;
+                --accent-gradient: linear-gradient(135deg, #3b82f6, #8b5cf6);
+                --text-primary: #f9fafb;
+                --text-secondary: #d1d5db;
+                --text-muted: #9ca3af;
+                --border-color: rgba(75, 85, 99, 0.3);
+                --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.3), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+                --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
               }
-              *{margin:0;padding:0;box-sizing:border-box}
-              body{
-                font-family:'Inter',sans-serif;background:var(--bg-1);
-                color:var(--text-1);overflow:hidden;position:relative;
+
+              * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
               }
-              /* animated background */
-              body::before{
-                content:'';position:fixed;inset:0;
-                background:radial-gradient(circle at 20% 80%,rgba(59,130,246,.1)0%,transparent 50%),
-                           radial-gradient(circle at 80% 20%,rgba(139,92,246,.1)0%,transparent 50%),
-                           radial-gradient(circle at 50% 50%,rgba(16,185,129,.05)0%,transparent 50%);
-                animation:pulse 8s ease-in-out infinite alternate;z-index:-1;
+
+              body {
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+                background: var(--bg-primary);
+                color: var(--text-primary);
+                overflow: hidden;
+                position: relative;
               }
-              @keyframes pulse{0%{opacity:.3}100%{opacity:.6}}
 
-              .app{height:100vh;display:flex;flex-direction:column;backdrop-filter:blur(10px)}
-              header{
-                background:rgba(17,24,39,.8);backdrop-filter:blur(20px);
-                border-bottom:1px solid var(--border);padding:1rem 2rem;
-                display:flex;justify-content:space-between;align-items:center
+              /* Animated background */
+              body::before {
+                content: '';
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: radial-gradient(circle at 20% 80%, rgba(59, 130, 246, 0.1) 0%, transparent 50%),
+                           radial-gradient(circle at 80% 20%, rgba(139, 92, 246, 0.1) 0%, transparent 50%),
+                           radial-gradient(circle at 40% 40%, rgba(16, 185, 129, 0.05) 0%, transparent 50%);
+                animation: pulse 8s ease-in-out infinite alternate;
+                z-index: -1;
               }
-              .logo{font-size:1.5rem;font-weight:700;background:var(--grad);
-                    -webkit-background-clip:text;color:transparent;display:flex;gap:.5rem}
-              .logo::before{content:'◆';font-size:1.2rem;animation:spin 3s linear infinite}
-              @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 
-              .status{display:flex;align-items:center;gap:.5rem;font-size:.875rem;font-weight:500}
-              .dot{width:8px;height:8px;border-radius:50%;background:#ef4444;animation:blink 2s infinite}
-              .dot.ok{background:#10b981;animation:none}
-              @keyframes blink{0%,50%{opacity:1}51%,100%{opacity:.3}}
+              @keyframes pulse {
+                0% { opacity: 0.3; }
+                100% { opacity: 0.6; }
+              }
 
-              .main{flex:1;display:grid;grid-template-columns:2fr 1fr;gap:1px;background:var(--border);overflow:hidden}
-              .panel{background:var(--bg-2);display:flex;flex-direction:column}
-              .p-head{background:var(--bg-3);padding:1rem 1.5rem;font-weight:600;
-                      font-size:.875rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-2);
-                      border-bottom:1px solid var(--border)}
-              .messages{flex:1;overflow-y:auto;padding:1.5rem;display:flex;flex-direction:column;gap:1rem;scroll-behavior:smooth}
-              .messages::-webkit-scrollbar,.logs::-webkit-scrollbar{width:6px}
-              .messages::-webkit-scrollbar-thumb,.logs::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+              .app-container {
+                height: 100vh;
+                display: flex;
+                flex-direction: column;
+                backdrop-filter: blur(10px);
+              }
 
-              .bubble{max-width:80%;padding:.875rem 1.25rem;border-radius:1.25rem;word-break:break-word;
-                      animation:msgIn .3s cubic-bezier(.68,-.55,.265,1.55)}
-              @keyframes msgIn{from{opacity:0;transform:translateY(20px) scale(.9)}to{opacity:1;transform:none}}
-              .self{align-self:flex-end;background:var(--grad);color:#fff;border-bottom-right-radius:.5rem}
-              .other{align-self:flex-start;background:var(--bg-3);border:1px solid var(--border);border-bottom-left-radius:.5rem}
-              .system{align-self:center;background:rgba(139,92,246,.1);border:1px solid rgba(139,92,246,.3);
-                      color:var(--text-muted);font-style:italic;font-size:.875rem;border-radius:2rem;max-width:none}
+              /* Header */
+              .header {
+                background: var(--bg-glass);
+                backdrop-filter: blur(20px);
+                border-bottom: 1px solid var(--border-color);
+                padding: 1rem 2rem;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                position: relative;
+                z-index: 10;
+              }
 
-              .meta{font-size:.75rem;opacity:.7;margin-bottom:.25rem;font-weight:500}
-              .input-area{padding:1.5rem;background:var(--bg-3);border-top:1px solid var(--border)}
-              .form{display:flex;gap:1rem}
-              .msg-input{flex:1;background:var(--bg-2);border:2px solid var(--border);border-radius:1.5rem;
-                         padding:1rem 1.5rem;color:var(--text-1);font-size:.9375rem;resize:none;outline:none;
-                         transition:border .2s;line-height:1.4;word-break:break-word}
-              .msg-input:focus{border-color:var(--accent-1);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
-              .send{background:var(--grad);border:none;width:48px;height:48px;border-radius:50%;color:#fff;
-                    cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1.25rem;
-                    box-shadow:var(--shadow-lg);transition:transform .2s}
-              .send:hover{transform:translateY(-2px);box-shadow:var(--shadow-xl)}
-              .send:disabled{opacity:.5;cursor:not-allowed;transform:none}
+              .header::before {
+                content: '';
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                height: 1px;
+                background: var(--accent-gradient);
+                opacity: 0.5;
+              }
 
-              .logs{flex:1;overflow-y:auto;padding:1rem;font-family:monospace;font-size:.8125rem;line-height:1.4;background:#0d1117}
-              .log-line{margin-bottom:.25rem;color:#8b949e;word-break:break-word;animation:logIn .2s ease-out}
-              @keyframes logIn{from{opacity:0;transform:translateX(-10px)}to{opacity:1;transform:none}}
+              .logo {
+                font-size: 1.5rem;
+                font-weight: 700;
+                background: var(--accent-gradient);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+              }
 
-              @media(max-width:1024px){.main{grid-template-columns:1fr;grid-template-rows:2fr 1fr}}
-              @media(max-width:768px){
-                header{padding:1rem}.logo{font-size:1.25rem}
-                .messages{padding:1rem}.input-area{padding:1rem}.bubble{max-width:90%}
+              .logo::before {
+                content: '◆';
+                font-size: 1.2rem;
+                animation: rotate 3s linear infinite;
+              }
+
+              @keyframes rotate {
+                from { transform: rotate(0deg); }
+                to { transform: rotate(360deg); }
+              }
+
+              .status-indicator {
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+                font-size: 0.875rem;
+                font-weight: 500;
+              }
+
+              .status-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: #ef4444;
+                animation: blink 2s infinite;
+              }
+
+              .status-dot.connected {
+                background: #10b981;
+                animation: none;
+              }
+
+              @keyframes blink {
+                0%, 50% { opacity: 1; }
+                51%, 100% { opacity: 0.3; }
+              }
+
+              /* Main content */
+              .main-content {
+                flex: 1;
+                display: grid;
+                grid-template-columns: 2fr 1fr;
+                gap: 1px;
+                background: var(--border-color);
+                overflow: hidden;
+              }
+
+              .panel {
+                background: var(--bg-secondary);
+                display: flex;
+                flex-direction: column;
+                position: relative;
+              }
+
+              .panel-header {
+                background: var(--bg-tertiary);
+                padding: 1rem 1.5rem;
+                font-weight: 600;
+                font-size: 0.875rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: var(--text-secondary);
+                border-bottom: 1px solid var(--border-color);
+              }
+
+              /* Chat Panel */
+              .chat-messages {
+                flex: 1;
+                overflow-y: auto;
+                overflow-x: hidden;
+                padding: 1.5rem;
+                display: flex;
+                flex-direction: column;
+                gap: 1rem;
+                scroll-behavior: smooth;
+                min-width: 0; /* Prevents flex item from overflowing */
+              }
+
+              .chat-messages::-webkit-scrollbar {
+                width: 6px;
+              }
+
+              .chat-messages::-webkit-scrollbar-track {
+                background: transparent;
+              }
+
+              .chat-messages::-webkit-scrollbar-thumb {
+                background: var(--border-color);
+                border-radius: 3px;
+              }
+
+              .message-bubble {
+                max-width: 70%;
+                min-width: 100px;
+                padding: 0.875rem 1.25rem;
+                border-radius: 1.25rem;
+                position: relative;
+                animation: messageIn 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+                word-wrap: break-word;
+                word-break: break-word;
+                overflow-wrap: break-word;
+                hyphens: auto;
+              }
+
+              @keyframes messageIn {
+                from {
+                  opacity: 0;
+                  transform: translateY(20px) scale(0.9);
+                }
+                to {
+                  opacity: 1;
+                  transform: translateY(0) scale(1);
+                }
+              }
+
+              .message-bubble.self {
+                align-self: flex-end;
+                background: var(--accent-gradient);
+                color: white;
+                border-bottom-right-radius: 0.5rem;
+              }
+
+              .message-bubble.other {
+                align-self: flex-start;
+                background: var(--bg-tertiary);
+                border-bottom-left-radius: 0.5rem;
+                border: 1px solid var(--border-color);
+              }
+
+              .message-bubble.system {
+                align-self: center;
+                background: rgba(139, 92, 246, 0.1);
+                border: 1px solid rgba(139, 92, 246, 0.3);
+                color: var(--text-muted);
+                font-style: italic;
+                font-size: 0.875rem;
+                border-radius: 2rem;
+                max-width: 85%;
+                text-align: center;
+              }
+
+              .message-meta {
+                font-size: 0.75rem;
+                opacity: 0.7;
+                margin-bottom: 0.25rem;
+                font-weight: 500;
+              }
+
+              .message-text {
+                line-height: 1.5;
+                white-space: pre-wrap;
+                overflow-wrap: break-word;
+                word-break: break-word;
+              }
+
+              /* Message input */
+              .message-input-container {
+                padding: 1.5rem;
+                background: var(--bg-tertiary);
+                border-top: 1px solid var(--border-color);
+              }
+
+              .message-form {
+                display: flex;
+                gap: 1rem;
+                align-items: flex-end;
+              }
+
+              .input-wrapper {
+                flex: 1;
+                position: relative;
+              }
+
+              .message-input {
+                width: 100%;
+                background: var(--bg-secondary);
+                border: 2px solid var(--border-color);
+                border-radius: 1.5rem;
+                padding: 1rem 1.5rem;
+                color: var(--text-primary);
+                font-size: 0.9375rem;
+                resize: none;
+                outline: none;
+                transition: all 0.2s ease;
+                font-family: inherit;
+              }
+
+              .message-input:focus {
+                border-color: var(--accent-primary);
+                box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+              }
+
+              .send-button {
+                background: var(--accent-gradient);
+                border: none;
+                width: 48px;
+                height: 48px;
+                border-radius: 50%;
+                color: white;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.2s ease;
+                font-size: 1.25rem;
+                box-shadow: var(--shadow-lg);
+              }
+
+              .send-button:hover {
+                transform: translateY(-2px);
+                box-shadow: var(--shadow-xl);
+              }
+
+              .send-button:active {
+                transform: translateY(0);
+              }
+
+              .send-button:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none;
+              }
+
+              /* Logs Panel */
+              .logs-container {
+                flex: 1;
+                overflow-y: auto;
+                padding: 1rem;
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                font-size: 0.8125rem;
+                line-height: 1.4;
+                background: #0d1117;
+              }
+
+              .logs-container::-webkit-scrollbar {
+                width: 6px;
+              }
+
+              .logs-container::-webkit-scrollbar-track {
+                background: transparent;
+              }
+
+              .logs-container::-webkit-scrollbar-thumb {
+                background: var(--border-color);
+                border-radius: 3px;
+              }
+
+              .log-line {
+                margin-bottom: 0.25rem;
+                color: #8b949e;
+                animation: logIn 0.2s ease-out;
+              }
+
+              @keyframes logIn {
+                from {
+                  opacity: 0;
+                  transform: translateX(-10px);
+                }
+                to {
+                  opacity: 1;
+                  transform: translateX(0);
+                }
+              }
+
+              /* Responsive design */
+              @media (max-width: 1024px) {
+                .main-content {
+                  grid-template-columns: 1fr;
+                  grid-template-rows: 2fr 1fr;
+                }
+              }
+
+              @media (max-width: 768px) {
+                .header {
+                  padding: 1rem;
+                }
+                
+                .logo {
+                  font-size: 1.25rem;
+                }
+                
+                .message-bubble {
+                  max-width: 85%;
+                }
+                
+                .message-input-container {
+                  padding: 1rem;
+                }
+                
+                .chat-messages {
+                  padding: 1rem;
+                }
+              }
+
+              /* Loading animation */
+              .loading-dots {
+                display: inline-flex;
+                gap: 2px;
+              }
+
+              .loading-dots span {
+                width: 4px;
+                height: 4px;
+                border-radius: 50%;
+                background: currentColor;
+                animation: loadingDot 1.4s infinite both;
+              }
+
+              .loading-dots span:nth-child(1) { animation-delay: 0s; }
+              .loading-dots span:nth-child(2) { animation-delay: 0.2s; }
+              .loading-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+              @keyframes loadingDot {
+                0%, 80%, 100% {
+                  transform: scale(0.8);
+                  opacity: 0.5;
+                }
+                40% {
+                  transform: scale(1);
+                  opacity: 1;
+                }
               }
             </style>
           </head>
           <body>
-            <div class="app">
-              <header>
+            <div class="app-container">
+              <header class="header">
                 <div class="logo">Nexus Chat</div>
-                <div class="status"><div class="dot" id="dot"></div><span id="stat">Connecting…</span></div>
+                <div class="status-indicator">
+                  <div class="status-dot" id="statusDot"></div>
+                  <span id="statusText">Connecting<span class="loading-dots"><span></span><span></span><span></span></span></span>
+                </div>
               </header>
 
-              <section class="main">
+              <main class="main-content">
                 <div class="panel">
-                  <div class="p-head">Chat Room</div>
-                  <div class="messages" id="chat"></div>
-                  <div class="input-area">
-                    <form class="form" id="form">
-                      <textarea id="input" class="msg-input" rows="1" placeholder="Type your message…" disabled></textarea>
-                      <button class="send" id="send" disabled>➤</button>
+                  <div class="panel-header">Chat Room</div>
+                  <div class="chat-messages" id="chatMessages"></div>
+                  <div class="message-input-container">
+                    <form class="message-form" id="messageForm">
+                      <div class="input-wrapper">
+                        <textarea 
+                          id="messageInput" 
+                          class="message-input" 
+                          placeholder="Type your message..." 
+                          rows="1"
+                          disabled
+                        ></textarea>
+                      </div>
+                      <button type="submit" class="send-button" id="sendButton" disabled>
+                        ➤
+                      </button>
                     </form>
                   </div>
                 </div>
 
                 <div class="panel">
-                  <div class="p-head">Server Logs</div>
-                  <div class="logs" id="logs"></div>
+                  <div class="panel-header">Server Logs</div>
+                  <div class="logs-container" id="logsContainer"></div>
                 </div>
-              </section>
+              </main>
             </div>
 
             <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
             <script>
-              /* ───────── helpers ───────── */
-              const qs   = q => document.querySelector(q);
-              const chat = qs('#chat'), logs = qs('#logs');
-              const input= qs('#input'), send = qs('#send');
-              const dot  = qs('#dot'), stat = qs('#stat');
+              const socket = io();
+              const statusDot = document.getElementById('statusDot');
+              const statusText = document.getElementById('statusText');
+              const chatMessages = document.getElementById('chatMessages');
+              const logsContainer = document.getElementById('logsContainer');
+              const messageForm = document.getElementById('messageForm');
+              const messageInput = document.getElementById('messageInput');
+              const sendButton = document.getElementById('sendButton');
+              let currentUser = '';
 
-              /* keep name across refresh */
-              const storedName = localStorage.getItem('display_name') || '';
-              const socket = io({ query: { name: storedName } });
-              let me = storedName;
-
-              /* auto‑grow textarea */
-              input.addEventListener('input', e=>{
-                e.target.style.height='auto';
-                e.target.style.height=Math.min(e.target.scrollHeight,120)+'px';
+              // Auto-resize textarea
+              messageInput.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = Math.min(this.scrollHeight, 120) + 'px';
               });
 
-              /* enter to send */
-              input.addEventListener('keydown', e=>{
-                if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send.click();}
-              });
-
-              /* scroll helper */
-              const bottom = el=>{el.scrollTop=el.scrollHeight};
-
-              /* render chat msg */
-              const appendMsg=m=>{
-                const div=document.createElement('div');
-                const sys=m.type==='system_notification';
-                const mine=!sys&&m.display_name===me;
-                div.className=`bubble ${sys?'system':mine?'self':'other'}`;
-
-                if(!sys){
-                  const meta=document.createElement('div');
-                  meta.className='meta';
-                  meta.textContent=`${m.display_name} • ${m.timestamp}`;
-                  div.appendChild(meta);
+              // Handle Enter key (Shift+Enter for new line)
+              messageInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  messageForm.dispatchEvent(new Event('submit'));
                 }
-                const txt=document.createElement('div');
-                txt.textContent=m.text;
-                div.appendChild(txt);
+              });
 
-                chat.appendChild(div);bottom(chat);
+              const scrollToBottom = (element) => {
+                element.scrollTop = element.scrollHeight;
               };
 
-              const appendLog=l=>{
-                const d=document.createElement('div');
-                d.className='log-line';
-                d.textContent=l;
-                logs.appendChild(d);
-                while(logs.children.length>100)logs.removeChild(logs.firstChild);
-                bottom(logs);
+              const addMessage = (message) => {
+                const messageDiv = document.createElement('div');
+                const isSystem = message.type === 'system_notification';
+                const isSelf = message.display_name === currentUser && !isSystem;
+                
+                messageDiv.className = `message-bubble ${isSystem ? 'system' : (isSelf ? 'self' : 'other')}`;
+                
+                if (!isSystem) {
+                  const metaDiv = document.createElement('div');
+                  metaDiv.className = 'message-meta';
+                  metaDiv.textContent = `${message.display_name} • ${message.timestamp}`;
+                  messageDiv.appendChild(metaDiv);
+                }
+                
+                const textDiv = document.createElement('div');
+                textDiv.className = 'message-text';
+                textDiv.textContent = message.text;
+                messageDiv.appendChild(textDiv);
+                
+                chatMessages.appendChild(messageDiv);
+                scrollToBottom(chatMessages);
               };
 
-              /* socket events */
-              socket.on('your_name', n=>{me=n;localStorage.setItem('display_name',n);});
-              socket.on('connect',()=>{
-                dot.classList.add('ok');stat.textContent='Connected';
-                input.disabled=false;send.disabled=false;
-              });
-              socket.on('disconnect',()=>{
-                dot.classList.remove('ok');stat.textContent='Disconnected…';
-                input.disabled=true;send.disabled=true;
-              });
-              socket.on('chat_history',h=>{chat.innerHTML='';h.forEach(appendMsg);});
-              socket.on('new_message',appendMsg);
-              socket.on('server_log',d=>appendLog(d.line));
+              const addLog = (line) => {
+                const logDiv = document.createElement('div');
+                logDiv.className = 'log-line';
+                logDiv.textContent = line;
+                logsContainer.appendChild(logDiv);
+                scrollToBottom(logsContainer);
+                
+                // Keep only last 100 log lines
+                while (logsContainer.children.length > 100) {
+                  logsContainer.removeChild(logsContainer.firstChild);
+                }
+              };
 
-              /* form submit */
-              qs('#form').addEventListener('submit',e=>{
+              // Socket event handlers
+              socket.on('connect', () => {
+                statusDot.classList.add('connected');
+                statusText.textContent = 'Connected';
+                messageInput.disabled = false;
+                sendButton.disabled = false;
+                console.log('Socket connected');
+              });
+
+              socket.on('disconnect', () => {
+                statusDot.classList.remove('connected');
+                statusText.innerHTML = 'Disconnected <span class="loading-dots"><span></span><span></span><span></span></span>';
+                messageInput.disabled = true;
+                sendButton.disabled = true;
+                console.log('Socket disconnected');
+              });
+
+              socket.on('chat_history', (history) => {
+                chatMessages.innerHTML = '';
+                history.forEach(addMessage);
+              });
+
+              socket.on('new_message', (message) => {
+                if (!currentUser && message.type === 'user_message') {
+                  currentUser = message.display_name;
+                }
+                addMessage(message);
+              });
+
+              socket.on('server_log', (data) => {
+                addLog(data.line);
+              });
+
+              // Form submission
+              messageForm.addEventListener('submit', (e) => {
                 e.preventDefault();
-                const t=input.value.trim();
-                if(t){socket.emit('send_message',{text:t});input.value='';input.style.height='auto';}
+                const text = messageInput.value.trim();
+                if (text && !messageInput.disabled) {
+                  socket.emit('send_message', { text });
+                  messageInput.value = '';
+                  messageInput.style.height = 'auto';
+                }
               });
             </script>
           </body>
           </html>
         HTML
 
-    # ────────────────────────────── run backend ────────────────────────────────
-    - name: Launch server
+    # 6. Start backend
+    - name: Launch Python chat server
       run: |
         nohup python api.py > api.log 2>&1 &
-        echo $! > pid
+        echo $! > python.pid
         sleep 8
-        kill -0 $(cat pid) || { cat api.log; exit 1; }
+
+        # Health‑check 1: process alive?
+        if ! kill -0 "$(cat python.pid)"; then
+          echo "Python process exited:"
+          cat api.log
+          exit 1
+        fi
+
+        # Health‑check 2: /ping
         curl -s http://localhost:8000/ping || true
 
-    # ──────────────────────────────── ngrok ───────────────────────────────────
-    - name: Start ngrok
+    # 7. Ngrok tunnel
+    - name: Start ngrok tunnel
       run: |
+        # Install ngrok
         curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
         echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-        sudo apt-get update -y && sudo apt-get install -y ngrok
+        sudo apt-get update -y
+        sudo apt-get install -y ngrok
+
+        # Auth & run
         ngrok config add-authtoken "$NGROK_TOKEN"
         nohup ngrok http 8000 --log=stdout --log-level=debug > ngrok.log 2>&1 &
-        for i in {1..5};do
-          sleep 3
-          URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[]|select(.proto=="https")|.public_url'|head -n1)
-          [ -n "$URL" ] && { echo "🚀 Ngrok URL: $URL";break; }
-        done || { tail -50 ngrok.log;exit 1;}
+        echo $! > ngrok.pid
 
-    # ────────────────────────── show logs & hold ──────────────────────────────
-    - name: Tail logs & keep runner
+        # Wait & fetch public URL
+        for i in {1..5}; do
+          sleep 3
+          URL=$(curl -s http://localhost:4040/api/tunnels \
+            | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)
+          if [ -n "$URL" ]; then
+            echo "🚀 Ngrok Public URL: $URL"
+            break
+          fi
+        done
+
+        if [ -z "$URL" ]; then
+          echo "Could not obtain ngrok URL"
+          tail -n 50 ngrok.log || true
+          tail -n 50 api.log   || true
+          exit 1
+        fi
+
+    # 8. Show logs & keep runner alive
+    - name: Tail logs and keep runner up
       run: |
+        echo "===== api.log (last 50) ====="
         tail -n 50 api.log || true
+        echo "===== ngrok.log (last 20) ====="
         tail -n 20 ngrok.log || true
-        echo "Runner sleeping — open URL above, press F12 for client logs."
+        echo "Runner sleeping for manual testing. Open dev‑console for client logs."
         sleep 3600
