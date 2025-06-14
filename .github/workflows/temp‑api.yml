@@ -30,7 +30,7 @@ jobs:
           import threading, time
 
           app = Flask(__name__, static_folder='static')
-          socketio = SocketIO(app)
+          socketio = SocketIO(app, cors_allowed_origins='*')
 
           @app.route('/')
           def index():
@@ -48,6 +48,7 @@ jobs:
 
           @socketio.on('message')
           def chat(msg):
+              app.logger.info(f"Chat message: {msg}")
               send(msg, broadcast=True)
 
           def broadcast_logs():
@@ -68,34 +69,44 @@ jobs:
           # Dashboard HTML
           cat <<'HTML' > static/index.html
           <!doctype html>
-          <html>
+          <html lang="en">
           <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>API Dashboard</title>
-            <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
           </head>
           <body>
             <h1>API Dashboard</h1>
             <div>
               <input id="msg" placeholder="Type chat" />
-              <button onclick="sendChat()">Send</button>
+              <button id="sendBtn">Send</button>
             </div>
             <h2>Chat</h2>
-            <pre id="chat"></pre>
+            <pre id="chat" style="height:200px; overflow:auto; border:1px solid #ccc;"></pre>
             <h2>Logs</h2>
-            <pre id="logs"></pre>
+            <pre id="logs" style="height:200px; overflow:auto; border:1px solid #ccc;"></pre>
+            <script src="/socket.io/socket.io.js"></script>
             <script>
-              const socket = io();
-              socket.on('message', m=>{
-                document.getElementById('chat').textContent += m + '\n';
+              document.addEventListener('DOMContentLoaded', ()=>{
+                console.log('Dashboard loaded');
+                const socket = io();
+                socket.on('connect', ()=> console.log('Socket connected'));
+                socket.on('message', msg =>{
+                  console.log('Received:', msg);
+                  const chat = document.getElementById('chat');
+                  chat.textContent += msg + '\n';
+                });
+                socket.on('log', line =>{
+                  const logs = document.getElementById('logs');
+                  logs.textContent += line;
+                });
+                document.getElementById('sendBtn').addEventListener('click', ()=>{
+                  const inp = document.getElementById('msg');
+                  console.log('Sending:', inp.value);
+                  socket.send(inp.value);
+                  inp.value = '';
+                });
               });
-              socket.on('log', l=>{
-                document.getElementById('logs').textContent += l;
-              });
-              function sendChat(){
-                const m = document.getElementById('msg').value;
-                socket.send(m);
-                document.getElementById('msg').value = '';
-              }
             </script>
           </body>
           </html>
