@@ -28,12 +28,19 @@ jobs:
           from flask import Flask, request, jsonify, send_from_directory
           from flask_socketio import SocketIO, send
           import threading, time
+          import logging # Recommended for explicit logging configuration
+
+          # Configure basic logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
           app = Flask(__name__, static_folder='static', static_url_path='')
+          # Add a logger for Flask app if not using default
+          app.logger.setLevel(logging.INFO)
+
           socketio = SocketIO(
               app,
               cors_allowed_origins='*',
-              serve_client=True,
+              serve_client=True, # This serves /socket.io/socket.io.js but we're using CDN
               async_mode='eventlet'
           )
 
@@ -54,20 +61,38 @@ jobs:
           @socketio.on('message')
           def chat(msg):
               app.logger.info(f"Chat message: {msg}")
-              socketio.emit('message', msg)
+              socketio.emit('message', msg) # Broadcast to all clients
 
           def broadcast_logs():
+              # Ensure api.log exists, create if not (though nohup redirection should do this)
+              # The 'a' mode creates if not exist, and places pointer at end.
+              # Then, we'll read from beginning if needed or from last known pos.
+              open('api.log', 'a').close() 
+              
               pos = 0
               while True:
-                  with open('api.log') as f:
-                      f.seek(pos)
-                      for line in f:
-                          socketio.emit('log', line)
-                      pos = f.tell()
+                  try:
+                      with open('api.log', 'r') as f:
+                          f.seek(pos)
+                          for line in f:
+                              if line.strip(): # Avoid sending empty lines
+                                  socketio.emit('log', line)
+                          pos = f.tell()
+                  except FileNotFoundError:
+                      # This case might occur if api.log is deleted during runtime
+                      app.logger.warning("api.log not found, will retry.")
+                      pos = 0 # Reset position if file is recreated
+                  except Exception as e:
+                      app.logger.error(f"Error in broadcast_logs: {e}")
                   time.sleep(1)
 
           if __name__ == '__main__':
-              threading.Thread(target=broadcast_logs, daemon=True).start()
+              # Start log broadcasting in a background thread
+              log_thread = threading.Thread(target=broadcast_logs, daemon=True)
+              log_thread.start()
+              
+              app.logger.info("Starting Flask-SocketIO server on 0.0.0.0:8000")
+              # Use eventlet to run the server
               socketio.run(app, host='0.0.0.0', port=8000)
           PY
 
@@ -80,39 +105,86 @@ jobs:
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>API Dashboard</title>
             <style>
-              body { font-family: sans-serif; padding: 1rem; }
-              pre { background: #f5f5f5; padding: 0.5rem; }
+              body { font-family: sans-serif; margin: 0; padding: 1rem; background-color: #f4f4f9; color: #333; }
+              h1, h2 { color: #333; }
+              #controls { margin-bottom: 1rem; display: flex; gap: 0.5rem; }
+              #msg { flex-grow: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }
+              button { padding: 0.5rem 1rem; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+              button:hover { background-color: #0056b3; }
+              pre { background: #fff; border: 1px solid #ddd; padding: 0.5rem; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
             </style>
           </head>
           <body>
             <h1>API Dashboard</h1>
-            <div>
-              <input id="msg" placeholder="Type chat" />
+            <div id="controls">
+              <input id="msg" placeholder="Type chat message" />
               <button id="sendBtn">Send</button>
             </div>
-            <h2>Chat</h2>
-            <pre id="chat" style="height:200px; overflow:auto;"></pre>
-            <h2>Logs</h2>
-            <pre id="logs" style="height:200px; overflow:auto;"></pre>
-            <script src="https://cdn.socket.io/5.3.0/socket.io.min.js"></script>
+            <h2>Chat Messages</h2>
+            <pre id="chat" style="height:200px; overflow-y:auto;"></pre>
+            <h2>Server Logs</h2>
+            <pre id="logs" style="height:200px; overflow-y:auto;"></pre>
+            
+            <!-- Corrected Socket.IO client CDN URL -->
+            <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
             <script>
               document.addEventListener('DOMContentLoaded', ()=>{
-                console.log('Dashboard loaded');
-                const socket = io({ transports: ['websocket'] });
-                socket.on('connect', ()=> console.log('Socket connected'));
-                socket.on('message', msg =>{
-                  console.log('Received:', msg);
-                  document.getElementById('chat').textContent += msg + '\n';
+                console.log('Dashboard loaded. Initializing Socket.IO connection...');
+                // Connect to the Socket.IO server (defaults to current host)
+                // Explicitly specifying path and transports can be useful for debugging
+                const socket = io({
+                    // path: '/socket.io', // Default path, usually not needed to specify
+                    transports: ['websocket', 'polling'] // Allow polling as fallback
                 });
-                socket.on('log', line =>{
-                  document.getElementById('logs').textContent += line;
+
+                const chatPre = document.getElementById('chat');
+                const logsPre = document.getElementById('logs');
+                const msgInput = document.getElementById('msg');
+                const sendButton = document.getElementById('sendBtn');
+
+                socket.on('connect', () => {
+                  console.log('Socket.IO connected successfully. SID:', socket.id);
+                  chatPre.textContent += 'System: Connected to server.\n';
                 });
-                document.getElementById('sendBtn').addEventListener('click', ()=>{
-                  const inp = document.getElementById('msg');
-                  console.log('Sending:', inp.value);
-                  socket.emit('message', inp.value);
-                  inp.value = '';
+
+                socket.on('disconnect', (reason) => {
+                  console.log('Socket.IO disconnected. Reason:', reason);
+                  chatPre.textContent += `System: Disconnected from server. Reason: ${reason}\n`;
                 });
+
+                socket.on('connect_error', (err) => {
+                  console.error('Socket.IO connection error:', err);
+                  logsPre.textContent += `Socket.IO Connection Error: ${err.message}\n`;
+                });
+
+                socket.on('message', msg => {
+                  console.log('Received chat message:', msg);
+                  chatPre.textContent += msg + '\n';
+                  chatPre.scrollTop = chatPre.scrollHeight; // Auto-scroll
+                });
+
+                socket.on('log', line => {
+                  // console.log('Received log line:', line); // Can be noisy
+                  logsPre.textContent += line; // Server already sends newlines
+                  logsPre.scrollTop = logsPre.scrollHeight; // Auto-scroll
+                });
+
+                sendButton.addEventListener('click', () => {
+                  const message = msgInput.value.trim();
+                  if (message) {
+                    console.log('Sending chat message:', message);
+                    socket.emit('message', message);
+                    msgInput.value = ''; // Clear input after sending
+                  }
+                });
+
+                msgInput.addEventListener('keypress', (event) => {
+                    if (event.key === 'Enter') {
+                        event.preventDefault(); // Prevent form submission if it were in a form
+                        sendButton.click();
+                    }
+                });
+
               });
             </script>
           </body>
@@ -121,14 +193,50 @@ jobs:
 
       - name: Start API and ngrok tunnel
         run: |
+          # Start the Flask API in the background, redirecting stdout/stderr to api.log
           nohup python api.py > api.log 2>&1 &
+          
+          # Wait a moment for the Python application to start and potentially create api.log
+          sleep 2 
+
+          # Install ngrok
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install -y ngrok
+          
+          # Configure ngrok with auth token
           ngrok config add-authtoken "$NGROK_TOKEN"
+          
+          # Start ngrok tunnel in the background, logging its output to ngrok.log
           nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
-          sleep 5
-          echo "🚀 Public URL: $(curl --silent http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')"
+          
+          # Wait for ngrok to establish the tunnel
+          sleep 5 
+          
+          # Display the public URL
+          # Adding retries or more robust check for ngrok API availability
+          NGROK_API_URL="http://localhost:4040/api/tunnels"
+          PUBLIC_URL=""
+          for i in {1..5}; do
+            PUBLIC_URL=$(curl --silent "$NGROK_API_URL" | jq -r '.tunnels[0].public_url // empty')
+            if [ -n "$PUBLIC_URL" ]; then
+              break
+            fi
+            echo "Waiting for ngrok tunnel URL... (attempt $i)"
+            sleep 2
+          done
+
+          if [ -n "$PUBLIC_URL" ]; then
+            echo "🚀 Public URL: $PUBLIC_URL"
+            echo "Inspect ngrok status: curl http://localhost:4040/api/status"
+          else
+            echo "❌ Failed to get ngrok public URL. Check ngrok.log for errors:"
+            cat ngrok.log || echo "ngrok.log not found or empty."
+            exit 1
+          fi
+          
+          echo "Flask API logs (api.log):"
+          tail -n 20 api.log || echo "api.log not found or empty."
 
       - name: Keep runner alive
         run: sleep 3600
