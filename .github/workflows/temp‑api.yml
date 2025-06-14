@@ -29,12 +29,13 @@ jobs:
         python-version: '3.12'
 
     # 3. System deps
-    - name: Install jq & curl & other utilities
+    - name: Install jq, curl, psmisc & other utilities
       run: |
         sudo apt-get update
         # Pin versions for better security and reproducibility if specific versions are known good
         # For this example, using latest, but in production, consider pinning.
-        sudo apt-get install -y jq curl unzip fuser
+        # INSTALL psmisc instead of fuser directly
+        sudo apt-get install -y jq curl unzip psmisc
 
     # 4. Python deps
     - name: Install Python requirements
