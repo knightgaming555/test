@@ -42,389 +42,590 @@ jobs:
         run: |
           mkdir static
           echo "Creating api.py..."
+          # NOTE: The content of the heredoc (api.py code) must be indented
+          # to the same level as this 'cat' command within the 'run' block.
           cat << 'EOF_API_PY' > api.py
-import os
-import sys
-import logging
-import threading
-import time
-from datetime import datetime
-from collections import deque
+          import os
+          import sys
+          import logging
+          import threading
+          import time
+          from datetime import datetime
+          from collections import deque
+          
+          from flask import Flask, request, jsonify, render_template, send_from_directory
+          from flask_socketio import SocketIO, emit
+          
+          # --- Global Variables ---
+          chat_history = deque(maxlen=150)  # Stores the last 150 messages
+          connected_users = {}  # Stores {sid: display_name}
+          
+          # --- Logging Setup ---
+          # Determine log level from environment variable
+          log_level_str = os.environ.get('LOG_LEVEL', 'INFO').upper()
+          numeric_level = getattr(logging, log_level_str, logging.INFO)
+          
+          # Configure logging to output to stdout, which will be captured by nohup into api.log
+          logging.basicConfig(
+              stream=sys.stdout,
+              level=numeric_level,
+              format='%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(message)s',
+              datefmt='%Y-%m-%d %H:%M:%S'
+          )
+          logger = logging.getLogger(__name__)
+          
+          # --- Flask & Socket.IO Setup ---
+          app = Flask(__name__)
+          app.config['SECRET_KEY'] = os.urandom(24) # Random secret key for session management
+          # Use eventlet as the async mode for Flask-SocketIO
+          socketio = SocketIO(app, async_mode='eventlet', logger=True, engineio_logger=True)
+          
+          
+          # --- Background Log Broadcaster ---
+          def broadcast_logs_thread_function(log_file_path, socketio_instance):
+              logger.info(f"Log broadcasting thread started for {log_file_path}.")
+              file_handler = None
+              
+              # Retry opening the log file as it might be created by nohup shortly after this thread starts
+              for _ in range(10): # Try for ~20 seconds
+                  try:
+                      file_handler = open(log_file_path, 'r')
+                      logger.info(f"Successfully opened {log_file_path} for log broadcasting.")
+                      break
+                  except FileNotFoundError:
+                      logger.warning(f"{log_file_path} not found. Retrying in 2 seconds...")
+                      time.sleep(2)
+                  except Exception as e:
+                      logger.error(f"Error opening {log_file_path} in log broadcaster: {e}")
+                      return # Critical error, exit thread
+              
+              if not file_handler:
+                  logger.error(f"Failed to open {log_file_path} after multiple retries. Log broadcasting disabled.")
+                  return
+          
+              try:
+                  # Go to the end of the file
+                  file_handler.seek(0, 2)
+                  while True:
+                      line = file_handler.readline()
+                      if not line:
+                          time.sleep(0.1)  # Wait for new lines
+                          continue
+                      # Emit the new log line to all connected clients
+                      socketio_instance.emit('server_log', {'line': line.strip()})
+              except Exception as e:
+                  logger.error(f"Error in log broadcasting thread: {e}", exc_info=True)
+              finally:
+                  if file_handler:
+                      file_handler.close()
+                  logger.info("Log broadcasting thread stopped.")
+          
+          # --- Flask HTTP Endpoints ---
+          @app.route('/')
+          def index():
+              logger.info(f"Serving index.html to {request.remote_addr}")
+              return render_template('index.html') # Assumes index.html is in a 'templates' folder or configure Flask
+          
+          @app.route('/static/<path:filename>')
+          def static_files(filename):
+              return send_from_directory('static', filename)
+          
+          @app.route('/ping', methods=['GET'])
+          def ping():
+              logger.debug(f"Received ping request from {request.remote_addr}")
+              return jsonify({"ok": True, "message": "Pong!"})
+          
+          # --- Socket.IO Event Handlers ---
+          @socketio.on('connect')
+          def handle_connect():
+              sid = request.sid
+              display_name = f"User-{sid[:5].upper()}"
+              connected_users[sid] = display_name
+              
+              logger.info(f"Client connected: {sid}, assigned display name: {display_name}")
+          
+              # Send chat history to the newly connected client
+              try:
+                  emit('chat_history', list(chat_history)) # Send a copy
+                  logger.debug(f"Sent chat history to {sid}")
+              except Exception as e:
+                  logger.error(f"Error sending chat_history to {sid}: {e}")
+          
+              # Create and broadcast a 'user joined' system message
+              join_message = {
+                  'user_display_name': 'System',
+                  'message_text': f"{display_name} has joined the chat.",
+                  'timestamp': datetime.now().strftime("%H:%M:%S"),
+                  'message_type': 'system_notification',
+                  'sid': 'system'
+              }
+              chat_history.append(join_message)
+              emit('new_message', join_message, broadcast=True)
+              logger.info(f"Broadcasted join message for {display_name}")
+          
+          @socketio.on('disconnect')
+          def handle_disconnect():
+              sid = request.sid
+              display_name = connected_users.pop(sid, f"User-{sid[:5].upper()} (Unknown)") # Get display name, provide fallback
+              
+              logger.info(f"Client disconnected: {sid}, display name: {display_name}")
+          
+              # Create and broadcast a 'user left' system message
+              leave_message = {
+                  'user_display_name': 'System',
+                  'message_text': f"{display_name} has left the chat.",
+                  'timestamp': datetime.now().strftime("%H:%M:%S"),
+                  'message_type': 'system_notification',
+                  'sid': 'system'
+              }
+              chat_history.append(leave_message)
+              emit('new_message', leave_message, broadcast=True)
+              logger.info(f"Broadcasted leave message for {display_name}")
+          
+          @socketio.on('send_message')
+          def handle_send_message(data):
+              sid = request.sid
+              user_display_name = connected_users.get(sid, f"User-{sid[:5].upper()} (Unknown)") # Fallback if user not found (should not happen)
+              
+              message_text = data.get('text', '').strip()
+              
+              if not message_text:
+                  logger.warning(f"Empty message received from {sid} ({user_display_name}). Ignoring.")
+                  emit('error_message', {'message': 'Cannot send an empty message.'}) # Optional: send error back to client
+                  return
+          
+              logger.info(f"Message from {user_display_name} ({sid}): '{message_text}'")
+              
+              new_msg_obj = {
+                  'user_display_name': user_display_name,
+                  'message_text': message_text, # Frontend should sanitize this for display if it uses innerHTML
+                  'timestamp': datetime.now().strftime("%H:%M:%S"),
+                  'message_type': 'user_message',
+                  'sid': sid # Include SID to allow client-side differentiation (e.g., styling own messages)
+              }
+              
+              chat_history.append(new_msg_obj)
+              emit('new_message', new_msg_obj, broadcast=True) # Broadcast to all, including sender
+              logger.debug(f"Broadcasted new message from {user_display_name} to all clients.")
+          
+          
+          # --- Main Execution ---
+          if __name__ == '__main__':
+              logger.info("Starting Realtime Chat Application...")
+              
+              # Start the log broadcasting thread
+              # It will tail 'api.log', where nohup redirects stdout/stderr of this script
+              log_broadcaster = threading.Thread(
+                  target=broadcast_logs_thread_function,
+                  args=('api.log', socketio),
+                  daemon=True  # Daemon thread will exit when the main program exits
+              )
+              log_broadcaster.start()
+          
+              logger.info("Attempting to start Flask-SocketIO server on 0.0.0.0:8000 with eventlet...")
+              try:
+                  # use_reloader=False is important for running with nohup and for stability with background threads
+                  # For Flask's render_template to find index.html, it needs to know where 'templates' is.
+                  # By default, it's a folder named 'templates' in the same dir as api.py.
+                  # However, our index.html is in 'static/'. We need to either move it or tell Flask.
+                  # For simplicity with current structure, using send_from_directory for `/` if index.html is in static.
+                  # Re-mapping root to serve from static if Flask can't find 'templates/index.html'.
+                  # The @app.route('/') already correctly serves static/index.html using render_template by assuming it's discoverable
+                  # If render_template fails for `/`, ensure Flask's template_folder is set or use send_from_directory directly.
+                  # The original api.py's `@app.route('/') def index(): return render_template('index.html')` might fail if 'static' isn't registered as template folder.
+                  # Let's adjust api.py's root route to explicitly serve static/index.html without render_template.
+                  # Or, ensure index.html IS IN a 'templates' folder if render_template is used.
+                  # The provided solution has `static/index.html`. So Flask's app.route('/') should serve that directly.
+                  # I will adjust the Python's '/' route to serve 'static/index.html' more directly instead of relying on render_template magic.
 
-from flask import Flask, request, jsonify, render_template, send_from_directory
-from flask_socketio import SocketIO, emit
+                  # Correction for serving index.html from Flask (already handled in api.py, it seems, by expecting it at `static/index.html`)
+                  # The flask app uses `render_template('index.html')` and also has `@app.route('/static/<path:filename>')`.
+                  # `render_template` looks in a `templates` directory by default. Our HTML is in `static`.
+                  # The Python script generated actually uses render_template, which is slightly problematic.
+                  # A quick fix in api.py would be:
+                  # @app.route('/')
+                  # def index():
+                  #     return send_from_directory('static', 'index.html')
+                  # Let's assume the current api.py's render_template will correctly pick up static/index.html
+                  # or that Flask is configured implicitly, which is unlikely.
+                  # For robustness, Flask's app = Flask(__name__, template_folder='static') or the send_from_directory fix is better.
+                  # Given the constraints, I will leave api.py as generated, and it *might* have issues serving index.html via render_template.
+                  # However, the user prompt was "serves static/index.html" for `/`.
 
-# --- Global Variables ---
-chat_history = deque(maxlen=150)  # Stores the last 150 messages
-connected_users = {}  # Stores {sid: display_name}
-
-# --- Logging Setup ---
-# Determine log level from environment variable
-log_level_str = os.environ.get('LOG_LEVEL', 'INFO').upper()
-numeric_level = getattr(logging, log_level_str, logging.INFO)
-
-# Configure logging to output to stdout, which will be captured by nohup into api.log
-logging.basicConfig(
-    stream=sys.stdout,
-    level=numeric_level,
-    format='%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
-# --- Flask & Socket.IO Setup ---
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24) # Random secret key for session management
-# Use eventlet as the async mode for Flask-SocketIO
-socketio = SocketIO(app, async_mode='eventlet', logger=True, engineio_logger=True)
-
-
-# --- Background Log Broadcaster ---
-def broadcast_logs_thread_function(log_file_path, socketio_instance):
-    logger.info(f"Log broadcasting thread started for {log_file_path}.")
-    file_handler = None
-    
-    # Retry opening the log file as it might be created by nohup shortly after this thread starts
-    for _ in range(10): # Try for ~20 seconds
-        try:
-            file_handler = open(log_file_path, 'r')
-            logger.info(f"Successfully opened {log_file_path} for log broadcasting.")
-            break
-        except FileNotFoundError:
-            logger.warning(f"{log_file_path} not found. Retrying in 2 seconds...")
-            time.sleep(2)
-        except Exception as e:
-            logger.error(f"Error opening {log_file_path} in log broadcaster: {e}")
-            return # Critical error, exit thread
-    
-    if not file_handler:
-        logger.error(f"Failed to open {log_file_path} after multiple retries. Log broadcasting disabled.")
-        return
-
-    try:
-        # Go to the end of the file
-        file_handler.seek(0, 2)
-        while True:
-            line = file_handler.readline()
-            if not line:
-                time.sleep(0.1)  # Wait for new lines
-                continue
-            # Emit the new log line to all connected clients
-            socketio_instance.emit('server_log', {'line': line.strip()})
-    except Exception as e:
-        logger.error(f"Error in log broadcasting thread: {e}", exc_info=True)
-    finally:
-        if file_handler:
-            file_handler.close()
-        logger.info("Log broadcasting thread stopped.")
-
-# --- Flask HTTP Endpoints ---
-@app.route('/')
-def index():
-    logger.info(f"Serving index.html to {request.remote_addr}")
-    return render_template('index.html')
-
-@app.route('/static/<path:filename>')
-def static_files(filename):
-    return send_from_directory('static', filename)
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    logger.debug(f"Received ping request from {request.remote_addr}")
-    return jsonify({"ok": True, "message": "Pong!"})
-
-# --- Socket.IO Event Handlers ---
-@socketio.on('connect')
-def handle_connect():
-    sid = request.sid
-    display_name = f"User-{sid[:5].upper()}"
-    connected_users[sid] = display_name
-    
-    logger.info(f"Client connected: {sid}, assigned display name: {display_name}")
-
-    # Send chat history to the newly connected client
-    try:
-        emit('chat_history', list(chat_history)) # Send a copy
-        logger.debug(f"Sent chat history to {sid}")
-    except Exception as e:
-        logger.error(f"Error sending chat_history to {sid}: {e}")
-
-    # Create and broadcast a 'user joined' system message
-    join_message = {
-        'user_display_name': 'System',
-        'message_text': f"{display_name} has joined the chat.",
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'message_type': 'system_notification',
-        'sid': 'system'
-    }
-    chat_history.append(join_message)
-    emit('new_message', join_message, broadcast=True)
-    logger.info(f"Broadcasted join message for {display_name}")
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    sid = request.sid
-    display_name = connected_users.pop(sid, f"User-{sid[:5].upper()} (Unknown)") # Get display name, provide fallback
-    
-    logger.info(f"Client disconnected: {sid}, display name: {display_name}")
-
-    # Create and broadcast a 'user left' system message
-    leave_message = {
-        'user_display_name': 'System',
-        'message_text': f"{display_name} has left the chat.",
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'message_type': 'system_notification',
-        'sid': 'system'
-    }
-    chat_history.append(leave_message)
-    emit('new_message', leave_message, broadcast=True)
-    logger.info(f"Broadcasted leave message for {display_name}")
-
-@socketio.on('send_message')
-def handle_send_message(data):
-    sid = request.sid
-    user_display_name = connected_users.get(sid, f"User-{sid[:5].upper()} (Unknown)") # Fallback if user not found (should not happen)
-    
-    message_text = data.get('text', '').strip()
-    
-    if not message_text:
-        logger.warning(f"Empty message received from {sid} ({user_display_name}). Ignoring.")
-        emit('error_message', {'message': 'Cannot send an empty message.'}) # Optional: send error back to client
-        return
-
-    logger.info(f"Message from {user_display_name} ({sid}): '{message_text}'")
-    
-    new_msg_obj = {
-        'user_display_name': user_display_name,
-        'message_text': message_text, # Frontend should sanitize this for display if it uses innerHTML
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'message_type': 'user_message',
-        'sid': sid # Include SID to allow client-side differentiation (e.g., styling own messages)
-    }
-    
-    chat_history.append(new_msg_obj)
-    emit('new_message', new_msg_obj, broadcast=True) # Broadcast to all, including sender
-    logger.debug(f"Broadcasted new message from {user_display_name} to all clients.")
-
-
-# --- Main Execution ---
-if __name__ == '__main__':
-    logger.info("Starting Realtime Chat Application...")
-    
-    # Start the log broadcasting thread
-    # It will tail 'api.log', where nohup redirects stdout/stderr of this script
-    log_broadcaster = threading.Thread(
-        target=broadcast_logs_thread_function,
-        args=('api.log', socketio),
-        daemon=True  # Daemon thread will exit when the main program exits
-    )
-    log_broadcaster.start()
-
-    logger.info("Attempting to start Flask-SocketIO server on 0.0.0.0:8000 with eventlet...")
-    try:
-        # use_reloader=False is important for running with nohup and for stability with background threads
-        socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False, debug=False)
-    except Exception as e:
-        logger.critical(f"Failed to start Flask-SocketIO server: {e}", exc_info=True)
-        sys.exit(1) # Exit if server fails to start
-    
-    logger.info("Flask-SocketIO server has shut down.")
-
-EOF_API_PY
+                  socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False, debug=False)
+              except Exception as e:
+                  logger.critical(f"Failed to start Flask-SocketIO server: {e}", exc_info=True)
+                  sys.exit(1) # Exit if server fails to start
+              
+              logger.info("Flask-SocketIO server has shut down.")
+          EOF_API_PY
           echo "api.py created successfully."
 
           echo "Creating static/index.html..."
+          # NOTE: The content of the heredoc (index.html code) must be indented
+          # to the same level as this 'cat' command within the 'run' block.
           cat << 'EOF_INDEX_HTML' > static/index.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Real-Time Chat</title>
-    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; display: flex; flex-direction: column; height: 100vh; }
-        header { background-color: #333; color: white; padding: 10px 20px; text-align: center; }
-        #connection-status { padding: 5px; text-align: center; background-color: #ffc107; font-weight: bold; }
-        #connection-status.connected { background-color: #28a745; color: white; }
-        #connection-status.disconnected { background-color: #dc3545; color: white; }
-        
-        .main-content { display: flex; flex: 1; overflow: hidden; padding: 10px; gap: 10px; }
-        .panel { background-color: white; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); display: flex; flex-direction: column; flex: 1; overflow: hidden; }
-        .panel h2 { font-size: 1.2em; margin: 0; padding: 10px; background-color: #eee; border-bottom: 1px solid #ddd; }
-        .scrollable-area { flex: 1; overflow-y: auto; padding: 10px; }
-        
-        #chat-panel { /* Specific styles if needed */ }
-        #logs-panel { /* Specific styles if needed */ }
-
-        #chat-messages .message { margin-bottom: 8px; padding: 8px; border-radius: 4px; word-wrap: break-word; }
-        #chat-messages .message .meta { font-size: 0.8em; color: #777; margin-bottom: 3px; }
-        #chat-messages .message .meta .user { font-weight: bold; }
-        #chat-messages .message .meta .time { margin-left: 10px; }
-        #chat-messages .message.user_message { background-color: #e6f7ff; border-left: 3px solid #1890ff; }
-        #chat-messages .message.system_notification { background-color: #f0f0f0; border-left: 3px solid #aaa; font-style: italic; }
-        #chat-messages .message.current_user { background-color: #d1f7c4; border-left: 3px solid #4CAF50;}
-
-
-        #log-lines .log-entry { font-family: monospace; font-size: 0.9em; white-space: pre-wrap; margin-bottom: 4px; border-bottom: 1px dotted #eee; padding-bottom: 2px; }
-
-        #chat-form { display: flex; padding: 10px; border-top: 1px solid #ddd; background-color: #f9f9f9;}
-        #chat-form input[type="text"] { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; }
-        #chat-form button { padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-        #chat-form button:disabled { background-color: #ccc; }
-
-        @media (max-width: 768px) {
-            .main-content { flex-direction: column; }
-            .panel { min-height: 200px; /* Ensure panels have some height on small screens */ }
-        }
-    </style>
-</head>
-<body>
-    <header><h1>Real-Time Chat Application</h1></header>
-    <div id="connection-status">Attempting to connect...</div>
-
-    <div class="main-content">
-        <div id="chat-panel" class="panel">
-            <h2>Chat</h2>
-            <div id="chat-messages" class="scrollable-area"></div>
-            <form id="chat-form">
-                <input type="text" id="message-input" placeholder="Type your message..." autocomplete="off">
-                <button type="submit" id="send-button">Send</button>
-            </form>
-        </div>
-        <div id="logs-panel" class="panel">
-            <h2>Server Logs</h2>
-            <div id="log-lines" class="scrollable-area"></div>
-        </div>
-    </div>
-
-    <script>
-        const socket = io({ autoConnect: false }); // Connect manually later
-        let clientSid = null; // To store client's own SID
-
-        const messageInput = document.getElementById('message-input');
-        const sendButton = document.getElementById('send-button');
-        const chatMessages = document.getElementById('chat-messages');
-        const logLines = document.getElementById('log-lines');
-        const connectionStatus = document.getElementById('connection-status');
-        const chatForm = document.getElementById('chat-form');
-
-        function updateConnectionStatus(status, message) {
-            connectionStatus.textContent = message;
-            connectionStatus.className = status; // 'connected', 'disconnected', or ''
-            messageInput.disabled = status !== 'connected';
-            sendButton.disabled = status !== 'connected';
-        }
-
-        function scrollToBottom(element) {
-            element.scrollTop = element.scrollHeight;
-        }
-
-        function addMessageToDOM(msg, ownSid) {
-            const item = document.createElement('div');
-            item.classList.add('message', msg.message_type);
-            if (msg.sid === ownSid && msg.message_type === 'user_message') {
-                item.classList.add('current_user');
-            }
-            
-            const meta = document.createElement('div');
-            meta.classList.add('meta');
-            
-            const userSpan = document.createElement('span');
-            userSpan.classList.add('user');
-            userSpan.textContent = msg.user_display_name;
-            meta.appendChild(userSpan);
-
-            const timeSpan = document.createElement('span');
-            timeSpan.classList.add('time');
-            timeSpan.textContent = msg.timestamp;
-            meta.appendChild(timeSpan);
-            
-            item.appendChild(meta);
-
-            const text = document.createElement('div');
-            text.classList.add('text');
-            text.textContent = msg.message_text; // Use textContent for XSS prevention
-            item.appendChild(text);
-            
-            chatMessages.appendChild(item);
-            scrollToBottom(chatMessages);
-        }
-
-        function addLogToDOM(log) {
-            const item = document.createElement('div');
-            item.classList.add('log-entry');
-            item.textContent = log.line; // Assuming log.line is plain text
-            logLines.appendChild(item);
-            scrollToBottom(logLines);
-        }
-
-        // Socket.IO event handlers
-        socket.on('connect', () => {
-            clientSid = socket.id; // Store our own SID
-            updateConnectionStatus('connected', 'Status: Connected');
-            console.log('Connected to server. SID:', clientSid);
-        });
-
-        socket.on('disconnect', (reason) => {
-            updateConnectionStatus('disconnected', `Status: Disconnected (${reason})`);
-            console.log('Disconnected from server. Reason:', reason);
-            clientSid = null;
-        });
-
-        socket.on('connect_error', (error) => {
-            updateConnectionStatus('', `Status: Connection Error - ${error.message}`);
-            console.error('Connection error:', error);
-        });
-
-        socket.on('chat_history', (history) => {
-            console.log('Received chat history:', history);
-            chatMessages.innerHTML = ''; // Clear previous messages
-            history.forEach(msg => addMessageToDOM(msg, clientSid));
-        });
-
-        socket.on('new_message', (msg) => {
-            console.log('Received new message:', msg);
-            addMessageToDOM(msg, clientSid);
-        });
-
-        socket.on('server_log', (log) => {
-            // console.log('Received server log:', log.line); // Can be spammy
-            addLogToDOM(log);
-        });
-        
-        socket.on('error_message', (data) => {
-            console.error('Server error message:', data.message);
-            alert(`Server Error: ${data.message}`);
-        });
-
-
-        // Form submission
-        chatForm.addEventListener('submit', (e) => {
-            e.preventDefault();
-            const messageText = messageInput.value.trim();
-            if (messageText && socket.connected) {
-                socket.emit('send_message', { text: messageText });
-                messageInput.value = '';
-            }
-        });
-
-        // Attempt to connect
-        console.log('Attempting to connect to Socket.IO server...');
-        socket.connect();
-
-    </script>
-</body>
-</html>
-EOF_INDEX_HTML
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Real-Time Chat</title>
+              <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; display: flex; flex-direction: column; height: 100vh; }
+                  header { background-color: #333; color: white; padding: 10px 20px; text-align: center; }
+                  #connection-status { padding: 5px; text-align: center; background-color: #ffc107; font-weight: bold; }
+                  #connection-status.connected { background-color: #28a745; color: white; }
+                  #connection-status.disconnected { background-color: #dc3545; color: white; }
+                  
+                  .main-content { display: flex; flex: 1; overflow: hidden; padding: 10px; gap: 10px; }
+                  .panel { background-color: white; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+                  .panel h2 { font-size: 1.2em; margin: 0; padding: 10px; background-color: #eee; border-bottom: 1px solid #ddd; }
+                  .scrollable-area { flex: 1; overflow-y: auto; padding: 10px; }
+                  
+                  #chat-panel { /* Specific styles if needed */ }
+                  #logs-panel { /* Specific styles if needed */ }
+          
+                  #chat-messages .message { margin-bottom: 8px; padding: 8px; border-radius: 4px; word-wrap: break-word; }
+                  #chat-messages .message .meta { font-size: 0.8em; color: #777; margin-bottom: 3px; }
+                  #chat-messages .message .meta .user { font-weight: bold; }
+                  #chat-messages .message .meta .time { margin-left: 10px; }
+                  #chat-messages .message.user_message { background-color: #e6f7ff; border-left: 3px solid #1890ff; }
+                  #chat-messages .message.system_notification { background-color: #f0f0f0; border-left: 3px solid #aaa; font-style: italic; }
+                  #chat-messages .message.current_user { background-color: #d1f7c4; border-left: 3px solid #4CAF50;}
+          
+          
+                  #log-lines .log-entry { font-family: monospace; font-size: 0.9em; white-space: pre-wrap; margin-bottom: 4px; border-bottom: 1px dotted #eee; padding-bottom: 2px; }
+          
+                  #chat-form { display: flex; padding: 10px; border-top: 1px solid #ddd; background-color: #f9f9f9;}
+                  #chat-form input[type="text"] { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; }
+                  #chat-form button { padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+                  #chat-form button:disabled { background-color: #ccc; }
+          
+                  @media (max-width: 768px) {
+                      .main-content { flex-direction: column; }
+                      .panel { min-height: 200px; /* Ensure panels have some height on small screens */ }
+                  }
+              </style>
+          </head>
+          <body>
+              <header><h1>Real-Time Chat Application</h1></header>
+              <div id="connection-status">Attempting to connect...</div>
+          
+              <div class="main-content">
+                  <div id="chat-panel" class="panel">
+                      <h2>Chat</h2>
+                      <div id="chat-messages" class="scrollable-area"></div>
+                      <form id="chat-form">
+                          <input type="text" id="message-input" placeholder="Type your message..." autocomplete="off">
+                          <button type="submit" id="send-button">Send</button>
+                      </form>
+                  </div>
+                  <div id="logs-panel" class="panel">
+                      <h2>Server Logs</h2>
+                      <div id="log-lines" class="scrollable-area"></div>
+                  </div>
+              </div>
+          
+              <script>
+                  const socket = io({ autoConnect: false }); // Connect manually later
+                  let clientSid = null; // To store client's own SID
+          
+                  const messageInput = document.getElementById('message-input');
+                  const sendButton = document.getElementById('send-button');
+                  const chatMessages = document.getElementById('chat-messages');
+                  const logLines = document.getElementById('log-lines');
+                  const connectionStatus = document.getElementById('connection-status');
+                  const chatForm = document.getElementById('chat-form');
+          
+                  function updateConnectionStatus(status, message) {
+                      connectionStatus.textContent = message;
+                      connectionStatus.className = status; // 'connected', 'disconnected', or ''
+                      messageInput.disabled = status !== 'connected';
+                      sendButton.disabled = status !== 'connected';
+                  }
+          
+                  function scrollToBottom(element) {
+                      element.scrollTop = element.scrollHeight;
+                  }
+          
+                  function addMessageToDOM(msg, ownSid) {
+                      const item = document.createElement('div');
+                      item.classList.add('message', msg.message_type);
+                      if (msg.sid === ownSid && msg.message_type === 'user_message') {
+                          item.classList.add('current_user');
+                      }
+                      
+                      const meta = document.createElement('div');
+                      meta.classList.add('meta');
+                      
+                      const userSpan = document.createElement('span');
+                      userSpan.classList.add('user');
+                      userSpan.textContent = msg.user_display_name;
+                      meta.appendChild(userSpan);
+          
+                      const timeSpan = document.createElement('span');
+                      timeSpan.classList.add('time');
+                      timeSpan.textContent = msg.timestamp;
+                      meta.appendChild(timeSpan);
+                      
+                      item.appendChild(meta);
+          
+                      const text = document.createElement('div');
+                      text.classList.add('text');
+                      text.textContent = msg.message_text; // Use textContent for XSS prevention
+                      item.appendChild(text);
+                      
+                      chatMessages.appendChild(item);
+                      scrollToBottom(chatMessages);
+                  }
+          
+                  function addLogToDOM(log) {
+                      const item = document.createElement('div');
+                      item.classList.add('log-entry');
+                      item.textContent = log.line; // Assuming log.line is plain text
+                      logLines.appendChild(item);
+                      scrollToBottom(logLines);
+                  }
+          
+                  // Socket.IO event handlers
+                  socket.on('connect', () => {
+                      clientSid = socket.id; // Store our own SID
+                      updateConnectionStatus('connected', 'Status: Connected');
+                      console.log('Connected to server. SID:', clientSid);
+                  });
+          
+                  socket.on('disconnect', (reason) => {
+                      updateConnectionStatus('disconnected', `Status: Disconnected (${reason})`);
+                      console.log('Disconnected from server. Reason:', reason);
+                      clientSid = null;
+                  });
+          
+                  socket.on('connect_error', (error) => {
+                      updateConnectionStatus('', `Status: Connection Error - ${error.message}`);
+                      console.error('Connection error:', error);
+                  });
+          
+                  socket.on('chat_history', (history) => {
+                      console.log('Received chat history:', history);
+                      chatMessages.innerHTML = ''; // Clear previous messages
+                      history.forEach(msg => addMessageToDOM(msg, clientSid));
+                  });
+          
+                  socket.on('new_message', (msg) => {
+                      console.log('Received new message:', msg);
+                      addMessageToDOM(msg, clientSid);
+                  });
+          
+                  socket.on('server_log', (log) => {
+                      // console.log('Received server log:', log.line); // Can be spammy
+                      addLogToDOM(log);
+                  });
+                  
+                  socket.on('error_message', (data) => {
+                      console.error('Server error message:', data.message);
+                      alert(`Server Error: ${data.message}`);
+                  });
+          
+          
+                  // Form submission
+                  chatForm.addEventListener('submit', (e) => {
+                      e.preventDefault();
+                      const messageText = messageInput.value.trim();
+                      if (messageText && socket.connected) {
+                          socket.emit('send_message', { text: messageText });
+                          messageInput.value = '';
+                      }
+                  });
+          
+                  // Attempt to connect
+                  console.log('Attempting to connect to Socket.IO server...');
+                  socket.connect();
+          
+              </script>
+          </body>
+          </html>
+          EOF_INDEX_HTML
           echo "static/index.html created successfully."
+
+          # Minor correction in api.py: Flask's default `render_template` looks for files in a 'templates' directory.
+          # To serve 'static/index.html' from the root path '/', the Flask app needs to be told where to find it.
+          # Either `app = Flask(__name__, template_folder='static')` or changing the route:
+          # `@app.route('/')`
+          # `def index(): return send_from_directory('static', 'index.html')`
+          # The current generated api.py uses `render_template('index.html')` which might not find `static/index.html`.
+          # For this exercise, I will assume it's handled or we'll see a 404 for `/` if Flask strict.
+          # The prompt specified "Serves static/index.html" for `/`.
+          # I will now modify the api.py heredoc slightly to use send_from_directory for robustness.
+
+          echo "Re-creating api.py with corrected root route for serving index.html..."
+          # This overrides the previously created api.py
+          cat << 'EOF_API_PY_CORRECTED' > api.py
+          import os
+          import sys
+          import logging
+          import threading
+          import time
+          from datetime import datetime
+          from collections import deque
+          
+          from flask import Flask, request, jsonify, send_from_directory # send_from_directory added
+          from flask_socketio import SocketIO, emit
+          
+          # --- Global Variables ---
+          chat_history = deque(maxlen=150)
+          connected_users = {}
+          
+          # --- Logging Setup ---
+          log_level_str = os.environ.get('LOG_LEVEL', 'INFO').upper()
+          numeric_level = getattr(logging, log_level_str, logging.INFO)
+          logging.basicConfig(
+              stream=sys.stdout,
+              level=numeric_level,
+              format='%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(message)s',
+              datefmt='%Y-%m-%d %H:%M:%S'
+          )
+          logger = logging.getLogger(__name__)
+          
+          # --- Flask & Socket.IO Setup ---
+          app = Flask(__name__) # Removed template_folder='static' for now to keep it simpler as per original prompt trace
+          app.config['SECRET_KEY'] = os.urandom(24)
+          socketio = SocketIO(app, async_mode='eventlet', logger=True, engineio_logger=True)
+          
+          # --- Background Log Broadcaster ---
+          def broadcast_logs_thread_function(log_file_path, socketio_instance):
+              logger.info(f"Log broadcasting thread started for {log_file_path}.")
+              file_handler = None
+              for _ in range(10):
+                  try:
+                      file_handler = open(log_file_path, 'r')
+                      logger.info(f"Successfully opened {log_file_path} for log broadcasting.")
+                      break
+                  except FileNotFoundError:
+                      logger.warning(f"{log_file_path} not found. Retrying in 2 seconds...")
+                      time.sleep(2)
+                  except Exception as e:
+                      logger.error(f"Error opening {log_file_path} in log broadcaster: {e}")
+                      return
+              if not file_handler:
+                  logger.error(f"Failed to open {log_file_path} after multiple retries. Log broadcasting disabled.")
+                  return
+              try:
+                  file_handler.seek(0, 2)
+                  while True:
+                      line = file_handler.readline()
+                      if not line:
+                          time.sleep(0.1)
+                          continue
+                      socketio_instance.emit('server_log', {'line': line.strip()})
+              except Exception as e:
+                  logger.error(f"Error in log broadcasting thread: {e}", exc_info=True)
+              finally:
+                  if file_handler: file_handler.close()
+                  logger.info("Log broadcasting thread stopped.")
+          
+          # --- Flask HTTP Endpoints ---
+          @app.route('/')
+          def index():
+              logger.info(f"Serving index.html to {request.remote_addr}")
+              # Explicitly serve static/index.html for the root path
+              return send_from_directory('static', 'index.html')
+          
+          @app.route('/static/<path:filename>')
+          def static_files(filename):
+              # This route is still useful if index.html itself refers to other static files like CSS/JS in the static dir
+              return send_from_directory('static', filename)
+          
+          @app.route('/ping', methods=['GET'])
+          def ping():
+              logger.debug(f"Received ping request from {request.remote_addr}")
+              return jsonify({"ok": True, "message": "Pong!"})
+          
+          # --- Socket.IO Event Handlers ( 그대로 유지 ) ---
+          @socketio.on('connect')
+          def handle_connect():
+              sid = request.sid
+              display_name = f"User-{sid[:5].upper()}"
+              connected_users[sid] = display_name
+              logger.info(f"Client connected: {sid}, assigned display name: {display_name}")
+              try:
+                  emit('chat_history', list(chat_history))
+                  logger.debug(f"Sent chat history to {sid}")
+              except Exception as e:
+                  logger.error(f"Error sending chat_history to {sid}: {e}")
+              join_message = {
+                  'user_display_name': 'System',
+                  'message_text': f"{display_name} has joined the chat.",
+                  'timestamp': datetime.now().strftime("%H:%M:%S"),
+                  'message_type': 'system_notification', 'sid': 'system'
+              }
+              chat_history.append(join_message)
+              emit('new_message', join_message, broadcast=True)
+              logger.info(f"Broadcasted join message for {display_name}")
+
+          @socketio.on('disconnect')
+          def handle_disconnect():
+              sid = request.sid
+              display_name = connected_users.pop(sid, f"User-{sid[:5].upper()} (Unknown)")
+              logger.info(f"Client disconnected: {sid}, display name: {display_name}")
+              leave_message = {
+                  'user_display_name': 'System',
+                  'message_text': f"{display_name} has left the chat.",
+                  'timestamp': datetime.now().strftime("%H:%M:%S"),
+                  'message_type': 'system_notification', 'sid': 'system'
+              }
+              chat_history.append(leave_message)
+              emit('new_message', leave_message, broadcast=True)
+              logger.info(f"Broadcasted leave message for {display_name}")
+
+          @socketio.on('send_message')
+          def handle_send_message(data):
+              sid = request.sid
+              user_display_name = connected_users.get(sid, f"User-{sid[:5].upper()} (Unknown)")
+              message_text = data.get('text', '').strip()
+              if not message_text:
+                  logger.warning(f"Empty message received from {sid} ({user_display_name}). Ignoring.")
+                  emit('error_message', {'message': 'Cannot send an empty message.'})
+                  return
+              logger.info(f"Message from {user_display_name} ({sid}): '{message_text}'")
+              new_msg_obj = {
+                  'user_display_name': user_display_name,
+                  'message_text': message_text,
+                  'timestamp': datetime.now().strftime("%H:%M:%S"),
+                  'message_type': 'user_message',
+                  'sid': sid
+              }
+              chat_history.append(new_msg_obj)
+              emit('new_message', new_msg_obj, broadcast=True)
+              logger.debug(f"Broadcasted new message from {user_display_name} to all clients.")
+
+          # --- Main Execution ---
+          if __name__ == '__main__':
+              logger.info("Starting Realtime Chat Application...")
+              log_broadcaster = threading.Thread(
+                  target=broadcast_logs_thread_function,
+                  args=('api.log', socketio),
+                  daemon=True
+              )
+              log_broadcaster.start()
+              logger.info("Attempting to start Flask-SocketIO server on 0.0.0.0:8000 with eventlet...")
+              try:
+                  socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False, debug=False)
+              except Exception as e:
+                  logger.critical(f"Failed to start Flask-SocketIO server: {e}", exc_info=True)
+                  sys.exit(1)
+              logger.info("Flask-SocketIO server has shut down.")
+          EOF_API_PY_CORRECTED
+          echo "api.py re-created successfully with corrected root route."
+
 
           echo "Verifying created files:"
           ls -lR .
           echo "File creation complete."
 
       - name: Start API and Ngrok Tunnel
-        shell: bash # Ensure bash is used for process substitution and other features
+        shell: bash
         run: |
           echo "Starting Python application in background..."
           nohup python api.py > api.log 2>&1 &
@@ -450,6 +651,10 @@ EOF_INDEX_HTML
             echo "Health Check 2: /ping endpoint is responsive."
           else
             echo "::warning::Health Check 2: /ping endpoint not responsive after 5s. This might be okay if Socket.IO is primary, but check logs."
+            echo "--- api.log (relevant part for server start) ---"
+            grep -i "Starting Realtime Chat Application" api.log || echo "Start message not in api.log"
+            grep -i "Attempting to start Flask-SocketIO server" api.log || echo "Server start attempt not in api.log"
+            grep -i "error" api.log || echo "No obvious errors in api.log"
           fi
 
           echo "Configuring Ngrok with token..."
@@ -466,7 +671,7 @@ EOF_INDEX_HTML
 
           echo "Retrieving Ngrok public URL..."
           NGROK_URL=""
-          for i in {1..10}; do # Increased retries to 10
+          for i in {1..10}; do
             NGROK_URL_HTTPS=$(curl -s --max-time 3 http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
             NGROK_URL_HTTP=$(curl -s --max-time 3 http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="http") | .public_url')
             
@@ -475,15 +680,20 @@ EOF_INDEX_HTML
                 break
             elif [ -n "$NGROK_URL_HTTP" ]; then
                 NGROK_URL=$NGROK_URL_HTTP
-                # Don't break yet, prefer https if it appears later
+                # Prefer https if it appears
             fi
 
-            if [ -n "$NGROK_URL" ]; then # If http was found, check if https is also there in same try
+            if [ -n "$NGROK_URL" ]; then 
                  if [ -n "$NGROK_URL_HTTPS" ]; then NGROK_URL=$NGROK_URL_HTTPS; fi
                  break
             fi
             
             echo "Failed to get Ngrok URL (attempt $i/10). Retrying in 3 seconds..."
+            # Print some ngrok log for diagnosis during retries
+            if [ $i -eq 3 ] || [ $i -eq 7 ]; then # Print logs on 3rd and 7th attempt
+                echo "--- ngrok.log (last 10 lines during retry $i) ---"
+                tail -n 10 ngrok.log || echo "ngrok.log not found or empty."
+            fi
             sleep 3
           done
 
@@ -516,6 +726,7 @@ EOF_INDEX_HTML
           sleep 3600
           
           echo "Stopping application and Ngrok..."
-          kill $(cat app.pid) || echo "App already stopped."
-          kill $(cat ngrok.pid) || echo "Ngrok already stopped."
+          # Adding -P to kill parent and children for nohup processes if any sub-shells were made by them
+          if [ -f app.pid ]; then kill -P $(cat app.pid) || echo "App already stopped or PID file issue."; else echo "app.pid not found."; fi
+          if [ -f ngrok.pid ]; then kill -P $(cat ngrok.pid) || echo "Ngrok already stopped or PID file issue."; else echo "ngrok.pid not found."; fi
           echo "Cleanup complete."
