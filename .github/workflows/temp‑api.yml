@@ -6,315 +6,785 @@ on:
 jobs:
   chat_application_server:
     runs-on: ubuntu-latest
+    
     env:
       NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
       LOG_LEVEL: INFO
-
+    
     steps:
-    # 1. Checkout
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    # 2. Python 3.12
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    # 3. System deps
-    - name: Install jq & curl
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y jq curl unzip
-
-    # 4. Python deps
-    - name: Install Python requirements
-      run: |
-        python -m pip install --upgrade pip
-        pip install flask flask-socketio eventlet
-
-    # 5. Generate backend & frontend
-    - name: Create application files
-      run: |
-        mkdir -p static
-
-        # -------- api.py --------
-        cat <<'PY' | sed 's/^  //' > api.py
-          import os, time, threading, logging
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install System and Python Dependencies
+        run: |
+          # Install system dependencies
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          
+          # Install Python dependencies
+          pip install --upgrade pip
+          pip install flask flask-socketio eventlet
+          
+          echo "Dependencies installed successfully"
+      
+      - name: Create Application Files
+        run: |
+          # Create static directory
+          mkdir -p static
+          
+          # Generate Flask backend (api.py)
+          cat > api.py << 'EOF'
+          #!/usr/bin/env python3
+          """
+          Real-time Chat Application Backend
+          Flask + Socket.IO server with eventlet for high performance
+          """
+          
+          import os
+          import sys
+          import logging
+          import threading
+          import time
+          from datetime import datetime
           from collections import deque
-          import eventlet
-          eventlet.monkey_patch()
-
-          from flask import Flask, jsonify, send_from_directory, request
+          from flask import Flask, render_template_string, jsonify, send_from_directory
           from flask_socketio import SocketIO, emit
-
-          # --- logging ---
-          LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+          
+          # Configure logging
+          log_level = getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper())
           logging.basicConfig(
-              level=LOG_LEVEL,
-              format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-              handlers=[
-                  logging.FileHandler("api.log"),
-                  logging.StreamHandler()
-              ]
+              level=log_level,
+              format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+              datefmt='%Y-%m-%d %H:%M:%S'
           )
-          log = logging.getLogger("chat_app")
-
-          # --- Flask / Socket.IO ---
-          app = Flask(__name__, static_folder='static', static_url_path='')
-          socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*")
-
-          chat_history = deque(maxlen=150)
-          users = {}
-
+          logger = logging.getLogger(__name__)
+          
+          # Initialize Flask app
+          app = Flask(__name__)
+          app.config['SECRET_KEY'] = 'realtime-chat-secret-key-2024'
+          
+          # Initialize Socket.IO with eventlet
+          socketio = SocketIO(
+              app, 
+              cors_allowed_origins="*",
+              async_mode='eventlet',
+              logger=True,
+              engineio_logger=True
+          )
+          
+          # In-memory data storage
+          chat_history = deque(maxlen=150)  # Last 150 messages
+          connected_users = {}  # {sid: {'name': 'User-ABC123', 'connected_at': timestamp}}
+          
+          def generate_username(sid):
+              """Generate a user-friendly name from Socket.IO session ID"""
+              return f"User-{sid[:5].upper()}"
+          
+          def create_message(msg_type, text, username=None):
+              """Create a standardized message object"""
+              return {
+                  'type': msg_type,
+                  'text': text,
+                  'username': username or 'System',
+                  'timestamp': datetime.now().strftime('%H:%M:%S')
+              }
+          
+          def add_to_history_and_broadcast(message):
+              """Add message to history and broadcast to all clients"""
+              chat_history.append(message)
+              socketio.emit('new_message', message, broadcast=True)
+              logger.info(f"Broadcasting message: {message['type']} from {message['username']}")
+          
+          # Flask HTTP Routes
           @app.route('/')
           def index():
+              """Serve the main chat interface"""
               return send_from_directory('static', 'index.html')
-
+          
           @app.route('/ping')
           def ping():
-              return jsonify(ok=True, message="Pong!")
-
-          # ---- Socket.IO events ----
+              """Health check endpoint"""
+              logger.info("Ping endpoint accessed")
+              return jsonify({"ok": True, "message": "Pong!"})
+          
+          # Socket.IO Event Handlers
           @socketio.on('connect')
-          def on_connect():
-              sid = request.sid
-              name = f"User-{sid[:5]}"
-              users[sid] = name
-              log.info("%s connected", name)
-
-              emit('chat_history', list(chat_history), to=sid)
-
-              msg = {
-                  "display_name": "System",
-                  "text": f"{name} has joined",
-                  "timestamp": time.strftime("%H:%M:%S"),
-                  "type": "system_notification"
+          def handle_connect():
+              """Handle new client connections"""
+              sid = request.sid if 'request' in globals() else 'unknown'
+              try:
+                  from flask import request
+                  sid = request.sid
+              except:
+                  sid = 'unknown'
+              
+              username = generate_username(sid)
+              connected_users[sid] = {
+                  'name': username,
+                  'connected_at': datetime.now()
               }
-              chat_history.append(msg)
-              socketio.emit('new_message', msg)
-
+              
+              logger.info(f"User connected: {username} (SID: {sid})")
+              
+              # Send chat history to the connecting client only
+              emit('chat_history', list(chat_history))
+              
+              # Create and broadcast join notification
+              join_message = create_message('system_notification', f"{username} has joined the chat", 'System')
+              add_to_history_and_broadcast(join_message)
+          
           @socketio.on('disconnect')
-          def on_disconnect():
-              sid = request.sid
-              name = users.pop(sid, f"User-{sid[:5]}")
-              log.info("%s disconnected", name)
-
-              msg = {
-                  "display_name": "System",
-                  "text": f"{name} has left",
-                  "timestamp": time.strftime("%H:%M:%S"),
-                  "type": "system_notification"
-              }
-              chat_history.append(msg)
-              socketio.emit('new_message', msg)
-
+          def handle_disconnect():
+              """Handle client disconnections"""
+              try:
+                  from flask import request
+                  sid = request.sid
+              except:
+                  sid = 'unknown'
+              
+              if sid in connected_users:
+                  username = connected_users[sid]['name']
+                  del connected_users[sid]
+                  
+                  logger.info(f"User disconnected: {username} (SID: {sid})")
+                  
+                  # Create and broadcast leave notification
+                  leave_message = create_message('system_notification', f"{username} has left the chat", 'System')
+                  add_to_history_and_broadcast(leave_message)
+              else:
+                  logger.warning(f"Unknown user disconnected (SID: {sid})")
+          
           @socketio.on('send_message')
-          def on_send_message(data):
-              sid = request.sid
-              name = users.get(sid, f"User-{sid[:5]}")
-              text = (data or {}).get('text', '').strip()
-              if not text:
+          def handle_message(data):
+              """Handle incoming chat messages from clients"""
+              try:
+                  from flask import request
+                  sid = request.sid
+              except:
+                  sid = 'unknown'
+              
+              if not data or 'text' not in data:
+                  logger.warning(f"Invalid message data received from {sid}: {data}")
                   return
-              msg = {
-                  "display_name": name,
-                  "text": text,
-                  "timestamp": time.strftime("%H:%M:%S"),
-                  "type": "user_message"
-              }
-              chat_history.append(msg)
-              log.info("Message from %s: %s", name, text)
-              socketio.emit('new_message', msg)
-
-          # --- Tail api.log and broadcast lines ---
-          def tail_logs():
-              try:
-                  with open('api.log', 'r') as f:
-                      f.seek(0, 2)
-                      while True:
-                          line = f.readline()
-                          if line:
-                              socketio.emit('server_log', {"line": line.rstrip()})
-                          else:
-                              eventlet.sleep(1)
-              except Exception as e:
-                  log.error("Log tail thread error: %s", e)
-
+              
+              message_text = data['text'].strip()
+              if not message_text:
+                  logger.warning(f"Empty message received from {sid}")
+                  return
+              
+              if sid not in connected_users:
+                  logger.warning(f"Message from unregistered user {sid}")
+                  return
+              
+              username = connected_users[sid]['name']
+              logger.info(f"Message received from {username}: {message_text}")
+              
+              # Create user message
+              user_message = create_message('user_message', message_text, username)
+              add_to_history_and_broadcast(user_message)
+          
+          def log_broadcaster():
+              """Background thread to broadcast log updates to clients"""
+              logger.info("Starting log broadcaster thread")
+              
+              log_file = 'api.log'
+              last_position = 0
+              
+              while True:
+                  try:
+                      if os.path.exists(log_file):
+                          with open(log_file, 'r') as f:
+                              f.seek(last_position)
+                              new_lines = f.readlines()
+                              current_position = f.tell()
+                              
+                              for line in new_lines:
+                                  line = line.strip()
+                                  if line:
+                                      socketio.emit('server_log', {'line': line}, broadcast=True)
+                              
+                              last_position = current_position
+                      
+                      time.sleep(2)  # Check for new logs every 2 seconds
+                  except Exception as e:
+                      logger.error(f"Error in log broadcaster: {e}")
+                      time.sleep(5)  # Wait longer on error
+          
           if __name__ == '__main__':
-              threading.Thread(target=tail_logs, daemon=True).start()
+              logger.info("Starting Real-time Chat Application")
+              
+              # Start log broadcasting thread
+              log_thread = threading.Thread(target=log_broadcaster, daemon=True)
+              log_thread.start()
+              logger.info("Log broadcaster thread started")
+              
               try:
-                  socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False)
+                  # Start Socket.IO server with eventlet
+                  logger.info("Starting Socket.IO server on 0.0.0.0:8000")
+                  socketio.run(
+                      app,
+                      host='0.0.0.0',
+                      port=8000,
+                      debug=False,
+                      use_reloader=False,
+                      log_output=True
+                  )
               except Exception as e:
-                  log.error("Startup failure: %s", e)
-                  raise
-        PY
-
-        # -------- static/index.html --------
-        cat <<'HTML' | sed 's/^  //' > static/index.html
+                  logger.error(f"Failed to start server: {e}")
+                  sys.exit(1)
+          EOF
+          
+          # Generate Frontend HTML (static/index.html)
+          cat > static/index.html << 'EOF'
           <!DOCTYPE html>
           <html lang="en">
           <head>
-            <meta charset="utf-8">
-            <title>Real‑Time Chat</title>
-            <style>
-              body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4}
-              header{background:#24292e;color:#fff;padding:10px 15px;font-size:18px}
-              #status{padding:6px 15px;background:#ededed;font-size:14px}
-              #container{display:flex;height:calc(100vh - 80px)}
-              #chat,#logs{flex:1;display:flex;flex-direction:column;border-right:1px solid #ddd}
-              #logs{border-right:none;background:#fafafa}
-              .panel-header{padding:8px 12px;font-weight:bold;background:#e9e9e9}
-              .messages{flex:1;overflow-y:auto;padding:10px}
-              .message{margin-bottom:8px}
-              .message.system{font-style:italic;color:#555}
-              .message.self{background:#d7ebff;padding:4px;border-radius:4px}
-              #form{display:flex;padding:10px;background:#e9e9e9}
-              #form input{flex:1;padding:8px;font-size:14px;border:1px solid #ccc;border-radius:4px}
-              #form button{margin-left:8px;padding:8px 12px;border:none;border-radius:4px;background:#24292e;color:#fff;cursor:pointer}
-              #form button:disabled{opacity:.5;cursor:not-allowed}
-              @media(max-width:768px){#container{flex-direction:column}#chat,#logs{height:50%}}
-            </style>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Real-time Chat Application</title>
+              <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+              <style>
+                  * {
+                      margin: 0;
+                      padding: 0;
+                      box-sizing: border-box;
+                  }
+          
+                  body {
+                      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      height: 100vh;
+                      display: flex;
+                      flex-direction: column;
+                  }
+          
+                  .header {
+                      background: rgba(255, 255, 255, 0.1);
+                      backdrop-filter: blur(10px);
+                      border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+                      padding: 1rem;
+                      text-align: center;
+                      color: white;
+                  }
+          
+                  .header h1 {
+                      font-size: 1.8rem;
+                      margin-bottom: 0.5rem;
+                  }
+          
+                  .status-bar {
+                      padding: 0.5rem;
+                      font-size: 0.9rem;
+                      font-weight: 500;
+                      border-radius: 20px;
+                      display: inline-block;
+                      min-width: 200px;
+                  }
+          
+                  .status-connecting {
+                      background: rgba(255, 193, 7, 0.8);
+                      color: #856404;
+                  }
+          
+                  .status-connected {
+                      background: rgba(40, 167, 69, 0.8);
+                      color: #155724;
+                  }
+          
+                  .status-disconnected {
+                      background: rgba(220, 53, 69, 0.8);
+                      color: #721c24;
+                  }
+          
+                  .main-container {
+                      display: flex;
+                      flex: 1;
+                      gap: 1rem;
+                      padding: 1rem;
+                      min-height: 0;
+                  }
+          
+                  .panel {
+                      background: rgba(255, 255, 255, 0.95);
+                      border-radius: 15px;
+                      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+                      backdrop-filter: blur(10px);
+                      border: 1px solid rgba(255, 255, 255, 0.2);
+                      display: flex;
+                      flex-direction: column;
+                      overflow: hidden;
+                  }
+          
+                  .chat-panel {
+                      flex: 2;
+                  }
+          
+                  .logs-panel {
+                      flex: 1;
+                  }
+          
+                  .panel-header {
+                      background: rgba(103, 126, 234, 0.1);
+                      padding: 1rem;
+                      font-weight: 600;
+                      color: #667eea;
+                      border-bottom: 1px solid rgba(103, 126, 234, 0.2);
+                  }
+          
+                  .panel-content {
+                      flex: 1;
+                      padding: 1rem;
+                      overflow-y: auto;
+                      display: flex;
+                      flex-direction: column;
+                      gap: 0.5rem;
+                  }
+          
+                  .chat-messages {
+                      flex: 1;
+                      overflow-y: auto;
+                      margin-bottom: 1rem;
+                  }
+          
+                  .message {
+                      margin-bottom: 0.75rem;
+                      padding: 0.75rem;
+                      border-radius: 10px;
+                      max-width: 85%;
+                      word-wrap: break-word;
+                  }
+          
+                  .message-user {
+                      background: linear-gradient(135deg, #667eea, #764ba2);
+                      color: white;
+                      margin-left: auto;
+                      border-bottom-right-radius: 4px;
+                  }
+          
+                  .message-other {
+                      background: #f8f9fa;
+                      border: 1px solid #e9ecef;
+                      margin-right: auto;
+                      border-bottom-left-radius: 4px;
+                  }
+          
+                  .message-system {
+                      background: rgba(255, 193, 7, 0.1);
+                      border: 1px solid rgba(255, 193, 7, 0.3);
+                      color: #856404;
+                      font-style: italic;
+                      text-align: center;
+                      margin: 0 auto;
+                      border-radius: 20px;
+                  }
+          
+                  .message-meta {
+                      font-size: 0.8rem;
+                      opacity: 0.8;
+                      margin-bottom: 0.25rem;
+                  }
+          
+                  .message-text {
+                      font-size: 0.95rem;
+                      line-height: 1.4;
+                  }
+          
+                  .chat-input-container {
+                      padding: 1rem;
+                      border-top: 1px solid rgba(103, 126, 234, 0.2);
+                      background: rgba(103, 126, 234, 0.05);
+                  }
+          
+                  .chat-form {
+                      display: flex;
+                      gap: 0.5rem;
+                  }
+          
+                  .chat-input {
+                      flex: 1;
+                      padding: 0.75rem;
+                      border: 2px solid #e9ecef;
+                      border-radius: 25px;
+                      font-size: 0.95rem;
+                      outline: none;
+                      transition: all 0.3s ease;
+                  }
+          
+                  .chat-input:focus {
+                      border-color: #667eea;
+                      box-shadow: 0 0 0 3px rgba(103, 126, 234, 0.1);
+                  }
+          
+                  .chat-input:disabled {
+                      background: #f8f9fa;
+                      cursor: not-allowed;
+                  }
+          
+                  .send-button {
+                      padding: 0.75rem 1.5rem;
+                      background: linear-gradient(135deg, #667eea, #764ba2);
+                      color: white;
+                      border: none;
+                      border-radius: 25px;
+                      font-weight: 600;
+                      cursor: pointer;
+                      transition: all 0.3s ease;
+                  }
+          
+                  .send-button:hover:not(:disabled) {
+                      transform: translateY(-2px);
+                      box-shadow: 0 4px 12px rgba(103, 126, 234, 0.4);
+                  }
+          
+                  .send-button:disabled {
+                      background: #6c757d;
+                      cursor: not-allowed;
+                      transform: none;
+                  }
+          
+                  .log-entry {
+                      font-family: 'Courier New', monospace;
+                      font-size: 0.85rem;
+                      padding: 0.5rem;
+                      margin-bottom: 0.25rem;
+                      background: rgba(0, 0, 0, 0.05);
+                      border-radius: 4px;
+                      border-left: 3px solid #667eea;
+                      word-break: break-all;
+                  }
+          
+                  @media (max-width: 768px) {
+                      .main-container {
+                          flex-direction: column;
+                      }
+                      
+                      .chat-panel {
+                          order: 1;
+                          flex: 3;
+                      }
+                      
+                      .logs-panel {
+                          order: 2;
+                          flex: 1;
+                      }
+                  }
+              </style>
           </head>
           <body>
-            <header>Real‑Time Chat Demo</header>
-            <div id="status">Status: <span id="connStatus">Connecting…</span></div>
-            <div id="container">
-              <div id="chat">
-                <div class="panel-header">Chat</div>
-                <div id="messages" class="messages"></div>
-                <form id="form">
-                  <input id="input" type="text" placeholder="Type a message…" autocomplete="off">
-                  <button type="submit">Send</button>
-                </form>
+              <div class="header">
+                  <h1>🚀 Real-time Chat Application</h1>
+                  <div class="status-bar status-connecting" id="status-bar">
+                      🔄 Attempting to connect...
+                  </div>
               </div>
-              <div id="logs">
-                <div class="panel-header">Server Logs</div>
-                <div id="logLines" class="messages"></div>
+          
+              <div class="main-container">
+                  <div class="panel chat-panel">
+                      <div class="panel-header">
+                          💬 Chat Messages
+                      </div>
+                      <div class="panel-content">
+                          <div class="chat-messages" id="chat-messages">
+                              <!-- Messages will be dynamically added here -->
+                          </div>
+                          <div class="chat-input-container">
+                              <form class="chat-form" id="chat-form">
+                                  <input 
+                                      type="text" 
+                                      class="chat-input" 
+                                      id="message-input" 
+                                      placeholder="Type your message..." 
+                                      maxlength="500"
+                                      disabled
+                                  >
+                                  <button type="submit" class="send-button" id="send-button" disabled>
+                                      Send
+                                  </button>
+                              </form>
+                          </div>
+                      </div>
+                  </div>
+          
+                  <div class="panel logs-panel">
+                      <div class="panel-header">
+                          📊 Server Logs
+                      </div>
+                      <div class="panel-content" id="server-logs">
+                          <!-- Server logs will be dynamically added here -->
+                      </div>
+                  </div>
               </div>
-            </div>
-            <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-            <script>
-              const socket = io();
-              const statusTxt = document.getElementById('connStatus');
-              const msgBox   = document.getElementById('messages');
-              const logBox   = document.getElementById('logLines');
-              const form     = document.getElementById('form');
-              const input    = document.getElementById('input');
-              let myName = '';
-
-              const scrollToEnd = el => { el.scrollTop = el.scrollHeight; };
-
-              const addMsg = m => {
-                const div = document.createElement('div');
-                div.className = 'message ' + (m.type === 'system_notification' ? 'system' : '');
-                if (m.display_name === myName) div.classList.add('self');
-                div.textContent = `[${m.timestamp}] ${m.display_name}: ${m.text}`;
-                msgBox.appendChild(div);
-                scrollToEnd(msgBox);
-              };
-
-              const addLog = line => {
-                const div = document.createElement('div');
-                div.className = 'message';
-                div.textContent = line;
-                logBox.appendChild(div);
-                scrollToEnd(logBox);
-              };
-
-              socket.on('connect', () => {
-                statusTxt.textContent = 'Connected';
-                input.disabled = false;
-                form.querySelector('button').disabled = false;
-                console.log('socket connected');
-              });
-
-              socket.on('disconnect', () => {
-                statusTxt.textContent = 'Disconnected';
-                input.disabled = true;
-                form.querySelector('button').disabled = true;
-                console.log('socket disconnected');
-              });
-
-              socket.on('chat_history', history => {
-                msgBox.innerHTML = '';
-                history.forEach(addMsg);
-              });
-
-              socket.on('new_message', m => {
-                if (!myName && m.type === 'user_message') myName = m.display_name;
-                addMsg(m);
-              });
-
-              socket.on('server_log', d => addLog(d.line));
-
-              form.addEventListener('submit', e => {
-                e.preventDefault();
-                const text = input.value.trim();
-                if (text) {
-                  socket.emit('send_message', { text });
-                  input.value = '';
-                }
-              });
-            </script>
+          
+              <script>
+                  // Initialize Socket.IO client
+                  const socket = io();
+                  
+                  // DOM elements
+                  const statusBar = document.getElementById('status-bar');
+                  const chatMessages = document.getElementById('chat-messages');
+                  const serverLogs = document.getElementById('server-logs');
+                  const chatForm = document.getElementById('chat-form');
+                  const messageInput = document.getElementById('message-input');
+                  const sendButton = document.getElementById('send-button');
+                  
+                  let currentUser = null;
+                  
+                  // Utility functions
+                  function updateStatus(status, message) {
+                      statusBar.className = `status-bar status-${status}`;
+                      statusBar.textContent = message;
+                      
+                      const isConnected = status === 'connected';
+                      messageInput.disabled = !isConnected;
+                      sendButton.disabled = !isConnected;
+                  }
+                  
+                  function scrollToBottom(element) {
+                      element.scrollTop = element.scrollHeight;
+                  }
+                  
+                  function escapeHtml(text) {
+                      const div = document.createElement('div');
+                      div.textContent = text;
+                      return div.innerHTML;
+                  }
+                  
+                  function renderMessage(message) {
+                      const messageDiv = document.createElement('div');
+                      
+                      if (message.type === 'system_notification') {
+                          messageDiv.className = 'message message-system';
+                          messageDiv.innerHTML = `
+                              <div class="message-text">${escapeHtml(message.text)}</div>
+                          `;
+                      } else {
+                          const isCurrentUser = currentUser && message.username === currentUser;
+                          messageDiv.className = `message ${isCurrentUser ? 'message-user' : 'message-other'}`;
+                          messageDiv.innerHTML = `
+                              <div class="message-meta">
+                                  <strong>${escapeHtml(message.username)}</strong> • ${message.timestamp}
+                              </div>
+                              <div class="message-text">${escapeHtml(message.text)}</div>
+                          `;
+                      }
+                      
+                      return messageDiv;
+                  }
+                  
+                  function addMessage(message) {
+                      const messageElement = renderMessage(message);
+                      chatMessages.appendChild(messageElement);
+                      scrollToBottom(chatMessages);
+                  }
+                  
+                  function addLogEntry(logLine) {
+                      const logDiv = document.createElement('div');
+                      logDiv.className = 'log-entry';
+                      logDiv.textContent = logLine;
+                      serverLogs.appendChild(logDiv);
+                      scrollToBottom(serverLogs);
+                      
+                      // Keep only last 100 log entries for performance
+                      while (serverLogs.children.length > 100) {
+                          serverLogs.removeChild(serverLogs.firstChild);
+                      }
+                  }
+                  
+                  // Socket.IO event handlers
+                  socket.on('connect', () => {
+                      console.log('Connected to server');
+                      updateStatus('connected', '✅ Status: Connected');
+                  });
+                  
+                  socket.on('disconnect', (reason) => {
+                      console.log('Disconnected from server:', reason);
+                      updateStatus('disconnected', '❌ Status: Disconnected');
+                      currentUser = null;
+                  });
+                  
+                  socket.on('connect_error', (error) => {
+                      console.error('Connection error:', error);
+                      updateStatus('disconnected', '❌ Status: Connection Failed');
+                  });
+                  
+                  socket.on('chat_history', (messages) => {
+                      console.log('Received chat history:', messages.length, 'messages');
+                      chatMessages.innerHTML = ''; // Clear existing messages
+                      messages.forEach(message => {
+                          addMessage(message);
+                      });
+                  });
+                  
+                  socket.on('new_message', (message) => {
+                      console.log('Received new message:', message);
+                      
+                      // Try to determine current user from first user message
+                      if (message.type === 'user_message' && !currentUser) {
+                          // This might be our first message, but we can't be sure
+                          // The server will handle this properly
+                      }
+                      
+                      addMessage(message);
+                  });
+                  
+                  socket.on('server_log', (data) => {
+                      if (data && data.line) {
+                          addLogEntry(data.line);
+                      }
+                  });
+                  
+                  socket.on('error_message', (data) => {
+                      if (data && data.message) {
+                          alert('Error: ' + data.message);
+                      }
+                  });
+                  
+                  // Chat form handling
+                  chatForm.addEventListener('submit', (e) => {
+                      e.preventDefault();
+                      
+                      const messageText = messageInput.value.trim();
+                      if (!messageText || !socket.connected) {
+                          return;
+                      }
+                      
+                      console.log('Sending message:', messageText);
+                      socket.emit('send_message', { text: messageText });
+                      
+                      // Clear the input
+                      messageInput.value = '';
+                  });
+                  
+                  // Enter key handling
+                  messageInput.addEventListener('keypress', (e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          chatForm.dispatchEvent(new Event('submit'));
+                      }
+                  });
+                  
+                  // Initialize
+                  console.log('Chat application initialized');
+                  console.log('Check browser developer console for detailed client-side logs');
+              </script>
           </body>
           </html>
-        HTML
-
-    # 6. Start backend
-    - name: Launch Python chat server
-      run: |
-        nohup python api.py > api.log 2>&1 &
-        echo $! > python.pid
-        sleep 8
-
-        # Health‑check 1: process alive?
-        if ! kill -0 "$(cat python.pid)"; then
-          echo "Python process exited:"
-          cat api.log
-          exit 1
-        fi
-
-        # Health‑check 2: /ping
-        curl -s http://localhost:8000/ping || true
-
-    # 7. Ngrok tunnel
-    - name: Start ngrok tunnel
-      run: |
-        # Install ngrok
-        curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-        echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-        sudo apt-get update -y
-        sudo apt-get install -y ngrok
-
-        # Auth & run
-        ngrok config add-authtoken "$NGROK_TOKEN"
-        nohup ngrok http 8000 --log=stdout --log-level=debug > ngrok.log 2>&1 &
-        echo $! > ngrok.pid
-
-        # Wait & fetch public URL
-        for i in {1..5}; do
-          sleep 3
-          URL=$(curl -s http://localhost:4040/api/tunnels \
-            | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)
-          if [ -n "$URL" ]; then
-            echo "🚀 Ngrok Public URL: $URL"
-            break
+          EOF
+          
+          echo "Application files created successfully"
+          ls -la
+          ls -la static/
+      
+      - name: Start API and Ngrok Tunnel
+        run: |
+          # Start Python app in background
+          echo "Starting Python Flask-SocketIO application..."
+          nohup python api.py > api.log 2>&1 &
+          API_PID=$!
+          echo "Python app started with PID: $API_PID"
+          
+          # Wait for app to start
+          echo "Waiting for application to start..."
+          sleep 8
+          
+          # Health Check 1: Verify Python process is running
+          if ! kill -0 $API_PID 2>/dev/null; then
+              echo "❌ Python process died! PID $API_PID is not running"
+              echo "API log contents:"
+              cat api.log
+              exit 1
           fi
-        done
-
-        if [ -z "$URL" ]; then
-          echo "Could not obtain ngrok URL"
-          tail -n 50 ngrok.log || true
-          tail -n 50 api.log   || true
-          exit 1
-        fi
-
-    # 8. Show logs & keep runner alive
-    - name: Tail logs and keep runner up
-      run: |
-        echo "===== api.log (last 50) ====="
-        tail -n 50 api.log || true
-        echo "===== ngrok.log (last 20) ====="
-        tail -n 20 ngrok.log || true
-        echo "Runner sleeping for manual testing. Open dev‑console for client logs."
-        sleep 3600
+          echo "✅ Python process is running (PID: $API_PID)"
+          
+          # Health Check 2: Test ping endpoint
+          echo "Testing /ping endpoint..."
+          if curl -f http://localhost:8000/ping; then
+              echo "✅ API health check passed"
+          else
+              echo "⚠️ API health check failed, but continuing (Socket.IO might still work)"
+          fi
+          
+          # Install and configure Ngrok
+          echo "Installing Ngrok..."
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update
+          sudo apt-get install -y ngrok
+          
+          # Configure Ngrok with token
+          ngrok config add-authtoken $NGROK_TOKEN
+          echo "Ngrok configured successfully"
+          
+          # Start Ngrok tunnel
+          echo "Starting Ngrok tunnel..."
+          nohup ngrok http 8000 --log=stdout --log-level=debug > ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "Ngrok started with PID: $NGROK_PID"
+          
+          # Wait for Ngrok to start
+          sleep 8
+          
+          # Retrieve public URL with retries
+          echo "Retrieving Ngrok public URL..."
+          PUBLIC_URL=""
+          for attempt in {1..5}; do
+              echo "Attempt $attempt/5 to get Ngrok URL..."
+              
+              # Try to get the tunnels info
+              if TUNNEL_RESPONSE=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null); then
+                  echo "Ngrok API response received"
+                  
+                  # Try to extract HTTPS URL first, then HTTP
+                  PUBLIC_URL=$(echo "$TUNNEL_RESPONSE" | jq -r '.tunnels[] | select(.proto=="https") | .public_url' 2>/dev/null | head -n1)
+                  
+                  if [ -z "$PUBLIC_URL" ] || [ "$PUBLIC_URL" = "null" ]; then
+                      PUBLIC_URL=$(echo "$TUNNEL_RESPONSE" | jq -r '.tunnels[] | select(.proto=="http") | .public_url' 2>/dev/null | head -n1)
+                  fi
+                  
+                  if [ -n "$PUBLIC_URL" ] && [ "$PUBLIC_URL" != "null" ]; then
+                      echo "✅ Successfully retrieved Ngrok URL: $PUBLIC_URL"
+                      break
+                  fi
+              fi
+              
+              echo "Failed to get URL, waiting 3 seconds before retry..."
+              sleep 3
+          done
+          
+          # Check if we got a URL
+          if [ -z "$PUBLIC_URL" ] || [ "$PUBLIC_URL" = "null" ]; then
+              echo "❌ Failed to retrieve Ngrok public URL after 5 attempts"
+              echo "Ngrok log contents:"
+              tail -n 50 ngrok.log
+              echo "API log contents:"
+              tail -n 50 api.log
+              exit 1
+          fi
+          
+          # Display success information
+          echo ""
+          echo "🚀 Ngrok Public URL: $PUBLIC_URL"
+          echo ""
+          echo "📱 Your real-time chat application is now live!"
+          echo "🌐 Access it at: $PUBLIC_URL"
+          echo "💬 Open the URL in multiple browser tabs to test real-time messaging"
+          echo "🔍 Check your browser's developer console for client-side logs"
+          echo ""
+          
+          # Display recent logs
+          echo "📊 Recent API logs (last 50 lines):"
+          tail -n 50 api.log
+          echo ""
+          echo "🔧 Recent Ngrok logs (last 20 lines):"
+          tail -n 20 ngrok.log
+          echo ""
+          
+          # Keep runner alive for testing
+          echo "⏰ Keeping the application running for 1 hour for testing..."
+          echo "🛑 The workflow will automatically stop after 1 hour"
+          sleep 3600
