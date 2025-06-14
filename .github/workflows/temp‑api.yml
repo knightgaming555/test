@@ -1,262 +1,444 @@
-name: temp-api
+name: temp-api-chat
 on: workflow_dispatch
 
 jobs:
-  api:
+  realtime_chat_app:
     runs-on: ubuntu-latest
     env:
       NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      LOG_LEVEL: INFO # You can change this to DEBUG for more verbose server logs
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12' # Using a modern Python version
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y jq
-          pip install flask flask-socketio eventlet >/dev/null
+          sudo apt-get update && sudo apt-get install -y jq
+          python -m pip install --upgrade pip
+          pip install flask flask-socketio eventlet " Werkzeug<3.0.0" >/dev/null # Werkzeug pinning for Flask compatibility if needed, though usually fine with latest Flask.
 
-      - name: Create Flask API and dashboard
+      - name: Create Real-Time Chat Application
         run: |
           mkdir -p static
-          # Flask app
+
+          # --- Backend: api.py ---
           cat <<'PY' > api.py
-          from flask import Flask, request, jsonify, send_from_directory
-          from flask_socketio import SocketIO
-          import threading, time
+          import os
           import logging
-          from collections import deque # For potentially limiting history
+          import threading
+          import time
+          from datetime import datetime
+          from collections import deque
 
-          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          from flask import Flask, request, jsonify, send_from_directory
+          from flask_socketio import SocketIO, emit
 
+          # --- Configuration ---
+          LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+          MAX_CHAT_HISTORY = 150 # Max number of chat messages to keep in memory
+          API_LOG_FILE = 'api.log' # For nohup output and log tailing
+
+          # --- Logging Setup ---
+          # Configure root logger to ensure all logs go through this setup
+          logging.basicConfig(
+              level=LOG_LEVEL,
+              format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+              handlers=[logging.StreamHandler()] # Outputs to stdout/stderr
+          )
+          logger = logging.getLogger(__name__) # Get logger for this module
+
+          # --- Flask & SocketIO App Setup ---
           app = Flask(__name__, static_folder='static', static_url_path='')
-          app.logger.setLevel(logging.INFO)
-
+          # SECRET_KEY is good practice, though not strictly vital for this simple app's security model
+          app.config['SECRET_KEY'] = os.urandom(32)
           socketio = SocketIO(
               app,
-              cors_allowed_origins='*',
-              serve_client=True, 
-              async_mode='eventlet'
+              async_mode='eventlet',
+              cors_allowed_origins='*', # Allow all origins for ngrok flexibility
+              logger=(LOG_LEVEL == 'DEBUG'),      # Enable SocketIO's own logger if LOG_LEVEL is DEBUG
+              engineio_logger=(LOG_LEVEL == 'DEBUG') # Enable Engine.IO's logger if LOG_LEVEL is DEBUG
           )
 
-          # In-memory store for chat history for the current session
-          # For a simple list:
-          chat_history = [] 
-          # Or, for a list with a maximum size (e.g., last 200 messages):
-          # MAX_HISTORY_MESSAGES = 200
-          # chat_history = deque(maxlen=MAX_HISTORY_MESSAGES)
+          # --- In-memory Data Stores ---
+          # Using deque for efficient append and pop from left if maxlen is reached
+          chat_history = deque(maxlen=MAX_CHAT_HISTORY)
+          # Store basic info about connected users: sid -> {'name': display_name}
+          connected_users = {}
 
+          # --- Helper Functions ---
+          def get_current_timestamp():
+              return datetime.now().strftime('%H:%M:%S')
 
+          def create_message_object(user_display_name, text, msg_type="user_message", **kwargs):
+              return {
+                  'user': user_display_name,
+                  'text': text,
+                  'timestamp': get_current_timestamp(),
+                  'type': msg_type,
+                  **kwargs # For any additional data
+              }
+
+          # --- HTTP Routes ---
           @app.route('/')
-          def index():
-              return send_from_directory('static', 'index.html')
+          def index_route():
+              return send_from_directory(app.static_folder, 'index.html')
 
           @app.route('/ping')
-          def ping():
-              return jsonify(ok=True)
+          def ping_route():
+              return jsonify(ok=True, message="Pong!", server_time=datetime.utcnow().isoformat())
 
-          @app.route('/echo', methods=['POST'])
-          def echo():
-              data = request.get_json(force=True)
-              app.logger.info(f"Echo: {data}")
-              return jsonify(echo=data)
-
+          # --- SocketIO Event Handlers ---
           @socketio.on('connect')
-          def handle_connect():
+          def handle_user_connect():
               sid = request.sid
-              app.logger.info(f"Client connected: {sid}")
-              
-              # Send existing chat history to the newly connected client
-              # Iterate over a copy if using a list, or list(deque) if using deque
-              history_to_send = list(chat_history) # Make a copy to iterate safely
-              for hist_msg in history_to_send:
-                  socketio.emit('message', hist_msg, to=sid)
-              
-              if history_to_send:
-                  socketio.emit('message', "System: Chat history loaded.", to=sid)
-              else:
-                  socketio.emit('message', "System: Welcome! No prior messages in this session.", to=sid)
+              # Create a simple, somewhat unique display name for the user
+              user_display_name = f"User-{sid[:5]}"
+              connected_users[sid] = {'name': user_display_name, 'sid': sid}
+              logger.info(f"Client connected: {user_display_name} ({sid})")
+
+              # Send the current chat history to the newly connected user
+              socketio.emit('chat_history', list(chat_history), to=sid)
+
+              # Create and broadcast a "user joined" system message
+              join_message = create_message_object(
+                  "System",
+                  f"{user_display_name} has joined the chat.",
+                  msg_type="system_notification"
+              )
+              chat_history.append(join_message) # Add to history
+              socketio.emit('new_message', join_message, broadcast=True) # Broadcast to all
 
           @socketio.on('disconnect')
-          def handle_disconnect():
+          def handle_user_disconnect():
               sid = request.sid
-              app.logger.info(f"Client disconnected: {sid}")
-              # Optionally, inform other users. If so, consider a different event name
-              # to avoid adding "User left" to chat_history via the 'message' handler.
-              # socketio.emit('user_status', f'User {sid[:5]}... has left.', broadcast=True)
+              user_info = connected_users.pop(sid, None)
+              if user_info:
+                  user_display_name = user_info.get('name', f"User-{sid[:5]}")
+                  logger.info(f"Client disconnected: {user_display_name} ({sid})")
+                  
+                  # Create and broadcast a "user left" system message
+                  leave_message = create_message_object(
+                      "System",
+                      f"{user_display_name} has left the chat.",
+                      msg_type="system_notification"
+                  )
+                  chat_history.append(leave_message) # Add to history
+                  socketio.emit('new_message', leave_message, broadcast=True) # Broadcast to all
+              else:
+                  logger.warning(f"Unknown client disconnected: {sid}")
 
-
-          @socketio.on('message')
-          def chat(msg_data):
+          @socketio.on('send_message')
+          def handle_send_chat_message(data):
               sid = request.sid
-              app.logger.info(f"Chat message from client {sid}: {msg_data}")
+              user_info = connected_users.get(sid)
               
-              # Add the new message to our in-memory history
-              chat_history.append(msg_data) 
+              if not user_info:
+                  logger.warning(f"Message from unknown SID {sid}. Data: {data}")
+                  # Optionally, send an error back or assign a temporary name
+                  socketio.emit('error_message', {'error': 'User not recognized. Please reconnect.'}, to=sid)
+                  return
+
+              user_display_name = user_info.get('name', f"Anonymous-{sid[:5]}")
+              message_text = data.get('text', '').strip()
+
+              if not message_text:
+                  logger.debug(f"Empty message from {user_display_name}, ignoring.")
+                  return
+
+              logger.info(f"Message from {user_display_name}: '{message_text}'")
               
-              # Broadcast the new message to ALL connected clients
-              socketio.emit('message', msg_data, broadcast=True)
+              # Create the message object
+              new_msg_obj = create_message_object(user_display_name, message_text, msg_type="user_message", sid=sid)
+              
+              # Add to history and broadcast
+              chat_history.append(new_msg_obj)
+              socketio.emit('new_message', new_msg_obj, broadcast=True)
 
 
-          def broadcast_logs():
-              # Ensure api.log exists, create if not
-              open('api.log', 'a').close() 
-              
+          # --- Background Thread for Tailing and Broadcasting Server Logs ---
+          def broadcast_server_logs():
+              # Ensure the log file is at least touched so open doesn't fail immediately
+              # (though nohup redirection should create it)
+              try:
+                  open(API_LOG_FILE, 'a').close()
+              except IOError as e:
+                  logger.error(f"Failed to touch {API_LOG_FILE}: {e}")
+
               pos = 0
+              logger.info("Server log broadcasting thread started.")
               while True:
                   try:
-                      with open('api.log', 'r') as f:
+                      with open(API_LOG_FILE, 'r') as f:
                           f.seek(pos)
-                          for line in f:
-                              if line.strip(): # Avoid sending empty lines
-                                  socketio.emit('log', line) # Broadcasts by default
+                          for line_content in f:
+                              if line_content.strip():
+                                  # Send each log line as a structured object
+                                  socketio.emit('server_log', {'line': line_content.strip()})
                           pos = f.tell()
                   except FileNotFoundError:
-                      app.logger.warning("api.log not found, will retry.")
-                      pos = 0 # Reset position if file is recreated
+                      # Wait and retry if log file isn't found (e.g., initial delay in creation)
+                      # logger.debug(f"{API_LOG_FILE} not found, retrying...")
+                      time.sleep(2) 
+                      pos = 0 # Reset position in case file was recreated
                   except Exception as e:
-                      app.logger.error(f"Error in broadcast_logs: {e}")
-                  time.sleep(1)
+                      logger.error(f"Error in broadcast_server_logs: {e}", exc_info=True)
+                      time.sleep(5) # Wait a bit longer on other errors before retrying
+                      pos = 0 # Attempt to recover by resetting position
+                  time.sleep(0.5) # Check for new log entries every 0.5 seconds
 
+
+          # --- Main Execution Guard ---
           if __name__ == '__main__':
-              log_thread = threading.Thread(target=broadcast_logs, daemon=True)
-              log_thread.start()
-              
-              app.logger.info("Starting Flask-SocketIO server on 0.0.0.0:8000")
-              socketio.run(app, host='0.0.0.0', port=8000)
+              # Start the log broadcasting thread as a daemon
+              log_broadcaster_thread = threading.Thread(target=broadcast_server_logs, daemon=True)
+              log_broadcaster_thread.start()
+
+              logger.info(f"Starting Real-Time Chat Server on 0.0.0.0:8000 (Log Level: {LOG_LEVEL})")
+              # Use eventlet to run the app.
+              # Note: Flask's 'debug' mode is not used directly here; SocketIO's loggers are used instead.
+              # 'use_reloader=False' is important for stability in non-dev/background environments.
+              socketio.run(app, host='0.0.0.0', port=8000, use_reloader=False)
           PY
 
-          # Dashboard HTML using CDN client (no changes needed here from previous correct version)
+          # --- Frontend: static/index.html ---
           cat <<'HTML' > static/index.html
-          <!doctype html>
+          <!DOCTYPE html>
           <html lang="en">
           <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>API Dashboard</title>
-            <style>
-              body { font-family: sans-serif; margin: 0; padding: 1rem; background-color: #f4f4f9; color: #333; }
-              h1, h2 { color: #333; }
-              #controls { margin-bottom: 1rem; display: flex; gap: 0.5rem; }
-              #msg { flex-grow: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }
-              button { padding: 0.5rem 1rem; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-              button:hover { background-color: #0056b3; }
-              pre { background: #fff; border: 1px solid #ddd; padding: 0.5rem; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
-            </style>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Real-Time Chat & Logs</title>
+              <style>
+                  :root { --primary-color: #007bff; --light-gray: #f8f9fa; --medium-gray: #e9ecef; --dark-gray: #343a40; --text-color: #212529; --border-color: #dee2e6; }
+                  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; background-color: var(--light-gray); color: var(--text-color); display: flex; flex-direction: column; height: 100vh; line-height: 1.6; }
+                  header { background-color: var(--primary-color); color: white; padding: 1rem 1.5rem; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); z-index: 10; }
+                  header h1 { margin: 0; font-size: 1.8rem; }
+                  .status-bar { padding: 0.5rem 1.5rem; background-color: var(--medium-gray); font-size: 0.9em; text-align: center; border-bottom: 1px solid var(--border-color); }
+                  .main-container { display: flex; flex-grow: 1; padding: 1rem; gap: 1rem; overflow: hidden; }
+                  .panel { background-color: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); display: flex; flex-direction: column; overflow: hidden; }
+                  .chat-panel { flex: 3; }
+                  .logs-panel { flex: 1; }
+                  .panel-header { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border-color); background-color: var(--light-gray); }
+                  .panel-header h2 { margin: 0; font-size: 1.1rem; color: var(--dark-gray); }
+                  .messages-area, .logs-area { list-style: none; margin: 0; padding: 1rem; overflow-y: auto; flex-grow: 1; word-break: break-word; }
+                  .message-item { margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; }
+                  .message-item .timestamp { font-size: 0.75em; color: #777; margin-left: 0.5em; float: right; }
+                  .message-item .user { font-weight: bold; }
+                  .user-message { background-color: #e7f3ff; border-left: 3px solid var(--primary-color); }
+                  .user-message .user { color: var(--primary-color); }
+                  .system-notification { background-color: #f1f3f5; color: #555; font-style: italic; text-align: center; font-size: 0.9em; padding: 0.5rem; }
+                  .my-message { background-color: #d1e7dd; border-left: 3px solid #198754; } /* Optional for self-messages */
+                  .log-entry { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace; font-size: 0.8em; padding: 0.2rem 0; border-bottom: 1px dashed #f0f0f0; }
+                  .log-entry:last-child { border-bottom: none; }
+                  .input-form { display: flex; padding: 0.75rem; border-top: 1px solid var(--border-color); background-color: var(--light-gray); }
+                  #messageInput { flex-grow: 1; padding: 0.6rem 0.9rem; border: 1px solid var(--border-color); border-radius: 20px; outline: none; margin-right: 0.5rem; font-size: 0.95rem; }
+                  #sendButton { padding: 0.6rem 1.2rem; background-color: var(--primary-color); color: white; border: none; border-radius: 20px; cursor: pointer; font-weight: 500; font-size: 0.95rem; transition: background-color 0.2s; }
+                  #sendButton:hover { background-color: #0056b3; }
+                  #sendButton:disabled { background-color: #aaa; cursor: not-allowed; }
+              </style>
           </head>
           <body>
-            <h1>API Dashboard</h1>
-            <div id="controls">
-              <input id="msg" placeholder="Type chat message" />
-              <button id="sendBtn">Send</button>
-            </div>
-            <h2>Chat Messages</h2>
-            <pre id="chat" style="height:200px; overflow-y:auto;"></pre>
-            <h2>Server Logs</h2>
-            <pre id="logs" style="height:200px; overflow-y:auto;"></pre>
-            
-            <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-            <script>
-              document.addEventListener('DOMContentLoaded', ()=>{
-                console.log('Dashboard loaded. Initializing Socket.IO connection...');
-                const socket = io({
-                    transports: ['websocket', 'polling'] 
-                });
+              <header><h1>Chat Room & Server Monitor</h1></header>
+              <div id="connectionStatus" class="status-bar">Attempting to connect...</div>
 
-                const chatPre = document.getElementById('chat');
-                const logsPre = document.getElementById('logs');
-                const msgInput = document.getElementById('msg');
-                const sendButton = document.getElementById('sendBtn');
+              <div class="main-container">
+                  <div class="panel chat-panel">
+                      <div class="panel-header"><h2>Chat Messages</h2></div>
+                      <ul id="messageList" class="messages-area"></ul>
+                      <form id="chatForm" class="input-form">
+                          <input type="text" id="messageInput" placeholder="Type a message and press Enter..." autocomplete="off" />
+                          <button type="submit" id="sendButton">Send</button>
+                      </form>
+                  </div>
+                  <div class="panel logs-panel">
+                      <div class="panel-header"><h2>Live Server Logs</h2></div>
+                      <ul id="logList" class="logs-area"></ul>
+                  </div>
+              </div>
 
-                socket.on('connect', () => {
-                  console.log('Socket.IO connected successfully. SID:', socket.id);
-                  // No longer need to add "Connected" message here, server sends history/welcome
-                  // chatPre.textContent += 'System: Connected to server.\n'; 
-                  // chatPre.scrollTop = chatPre.scrollHeight;
-                });
+              <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+              <script>
+                  document.addEventListener('DOMContentLoaded', () => {
+                      const socket = io({ transports: ['websocket', 'polling'] });
 
-                socket.on('disconnect', (reason) => {
-                  console.log('Socket.IO disconnected. Reason:', reason);
-                  chatPre.textContent += `System: Disconnected from server. Reason: ${reason}\n`;
-                  chatPre.scrollTop = chatPre.scrollHeight;
-                });
+                      const chatForm = document.getElementById('chatForm');
+                      const messageInput = document.getElementById('messageInput');
+                      const sendButton = document.getElementById('sendButton');
+                      const messageList = document.getElementById('messageList');
+                      const logList = document.getElementById('logList');
+                      const connectionStatus = document.getElementById('connectionStatus');
+                      
+                      let currentSocketID = null;
 
-                socket.on('connect_error', (err) => {
-                  console.error('Socket.IO connection error:', err);
-                  logsPre.textContent += `Socket.IO Connection Error: ${err.message}\n`;
-                  logsPre.scrollTop = logsPre.scrollHeight;
-                });
+                      // --- Helper to add messages to UI ---
+                      function appendMessageToChat(msgObj) {
+                          const item = document.createElement('li');
+                          item.classList.add('message-item', msgObj.type); // e.g., 'user-message', 'system-notification'
 
-                socket.on('message', msg => {
-                  // This handler now receives both historical and real-time messages
-                  console.log('Received chat message:', msg);
-                  chatPre.textContent += msg + '\n';
-                  chatPre.scrollTop = chatPre.scrollHeight; 
-                });
+                          // Optional: Differentiate self-sent messages
+                          // if (msgObj.type === 'user_message' && msgObj.sid === currentSocketID) {
+                          //     item.classList.add('my-message');
+                          // }
 
-                socket.on('log', line => {
-                  logsPre.textContent += line; 
-                  logsPre.scrollTop = logsPre.scrollHeight; 
-                });
+                          const userSpan = document.createElement('span');
+                          userSpan.classList.add('user');
+                          userSpan.textContent = msgObj.user ? msgObj.user + ': ' : '';
+                          
+                          const textSpan = document.createElement('span');
+                          textSpan.classList.add('text');
+                          textSpan.textContent = msgObj.text; // Text content should be safe from XSS here
 
-                sendButton.addEventListener('click', () => {
-                  const message = msgInput.value.trim();
-                  if (message) {
-                    console.log('Sending chat message:', message);
-                    socket.emit('message', message);
-                    msgInput.value = ''; 
-                  }
-                });
+                          const timeSpan = document.createElement('span');
+                          timeSpan.classList.add('timestamp');
+                          timeSpan.textContent = msgObj.timestamp;
+                          
+                          if (msgObj.type === 'user_message') {
+                              item.appendChild(userSpan);
+                              item.appendChild(textSpan);
+                              item.appendChild(timeSpan);
+                          } else { // System notification style
+                              item.appendChild(textSpan); // Simpler layout
+                          }
+                          messageList.appendChild(item);
+                          messageList.scrollTop = messageList.scrollHeight; // Auto-scroll
+                      }
 
-                msgInput.addEventListener('keypress', (event) => {
-                    if (event.key === 'Enter') {
-                        event.preventDefault(); 
-                        sendButton.click();
-                    }
-                });
-              });
-            </script>
+                      // --- Helper to add logs to UI ---
+                      function appendLogEntry(logObj) {
+                          const item = document.createElement('li');
+                          item.classList.add('log-entry');
+                          item.textContent = logObj.line; // Text content
+                          logList.appendChild(item);
+                          logList.scrollTop = logList.scrollHeight; // Auto-scroll
+                      }
+
+                      // --- Socket.IO Event Listeners ---
+                      socket.on('connect', () => {
+                          currentSocketID = socket.id;
+                          console.log('Successfully connected to server. SID:', currentSocketID);
+                          connectionStatus.textContent = 'Status: Connected';
+                          connectionStatus.style.backgroundColor = '#d1e7dd';
+                          connectionStatus.style.color = '#0f5132';
+                          sendButton.disabled = false;
+                          messageInput.disabled = false;
+                      });
+
+                      socket.on('disconnect', (reason) => {
+                          console.warn('Disconnected from server. Reason:', reason);
+                          connectionStatus.textContent = `Status: Disconnected (${reason})`;
+                          connectionStatus.style.backgroundColor = '#f8d7da';
+                          connectionStatus.style.color = '#842029';
+                          sendButton.disabled = true;
+                          messageInput.disabled = true;
+                      });
+
+                      socket.on('connect_error', (error) => {
+                          console.error('Connection attempt failed:', error);
+                          connectionStatus.textContent = `Status: Connection Error (${error.message || 'Unknown error'})`;
+                          connectionStatus.style.backgroundColor = '#fff3cd';
+                          connectionStatus.style.color = '#664d03';
+                          sendButton.disabled = true;
+                          messageInput.disabled = true;
+                      });
+
+                      socket.on('chat_history', (historyArray) => {
+                          console.log('Received chat history:', historyArray.length, 'messages');
+                          messageList.innerHTML = ''; // Clear existing messages (e.g., on reconnect)
+                          historyArray.forEach(appendMessageToChat);
+                      });
+
+                      socket.on('new_message', (msgObj) => {
+                          console.log('Received new message:', msgObj);
+                          appendMessageToChat(msgObj);
+                      });
+
+                      socket.on('server_log', (logObj) => {
+                          appendLogEntry(logObj);
+                      });
+
+                      socket.on('error_message', (errObj) => {
+                          console.error('Server error message:', errObj.error);
+                          // Could display this in a more user-friendly way if needed
+                          alert('Server Error: ' + errObj.error);
+                      });
+
+                      // --- Form Submission ---
+                      chatForm.addEventListener('submit', (event) => {
+                          event.preventDefault(); // Prevent page reload
+                          const messageText = messageInput.value.trim();
+                          if (messageText && socket.connected) {
+                              socket.emit('send_message', { text: messageText });
+                              messageInput.value = ''; // Clear input field
+                          }
+                          messageInput.focus(); // Keep focus on input
+                      });
+
+                      // Initial state for send button (disabled until connected)
+                      sendButton.disabled = true;
+                      messageInput.disabled = true;
+                  });
+              </script>
           </body>
           </html>
           HTML
 
       - name: Start API and ngrok tunnel
         run: |
+          echo "Starting the Python API application in the background..."
           nohup python api.py > api.log 2>&1 &
-          sleep 2 
+          
+          # Wait a few seconds for the Python server to initialize
+          echo "Waiting for API server to start..."
+          sleep 5
+
+          echo "Setting up ngrok..."
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt update && sudo apt install -y ngrok
+          sudo apt-get update && sudo apt-get install -y ngrok
           ngrok config add-authtoken "$NGROK_TOKEN"
-          nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
-          sleep 5 
           
+          echo "Starting ngrok tunnel for port 8000..."
+          nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
+          
+          # Wait for ngrok to establish the tunnel and its API to be available
+          echo "Waiting for ngrok tunnel..."
+          sleep 7 # Increased wait time for ngrok
+
           NGROK_API_URL="http://localhost:4040/api/tunnels"
           PUBLIC_URL=""
-          for i in {1..5}; do
-            PUBLIC_URL=$(curl --silent "$NGROK_API_URL" | jq -r '.tunnels[0].public_url // empty')
-            if [ -n "$PUBLIC_URL" ]; then
-              break
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          
+          while [ -z "$PUBLIC_URL" ] && [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; do
+            PUBLIC_URL=$(curl --silent --max-time 5 "$NGROK_API_URL" | jq -r '.tunnels[] | select(.proto=="https") | .public_url // empty' | head -n 1)
+            if [ -z "$PUBLIC_URL" ]; then
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "Failed to get ngrok URL (attempt ${RETRY_COUNT}/${MAX_RETRIES}). Retrying in 3 seconds..."
+              sleep 3
             fi
-            echo "Waiting for ngrok tunnel URL... (attempt $i)"
-            sleep 2
           done
 
           if [ -n "$PUBLIC_URL" ]; then
-            echo "🚀 Public URL: $PUBLIC_URL"
-            echo "Inspect ngrok status: curl http://localhost:4040/api/status"
+            echo "🚀 Ngrok Public URL: $PUBLIC_URL"
+            echo "💡 Inspect ngrok status: curl http://localhost:4040/api/status"
+            echo "📜 Flask API logs (tail):"
+            tail -n 30 api.log || echo "api.log not found or is empty."
+            echo "📜 Ngrok logs (tail):"
+            tail -n 10 ngrok.log || echo "ngrok.log not found or is empty."
           else
-            echo "❌ Failed to get ngrok public URL. Check ngrok.log for errors:"
-            cat ngrok.log || echo "ngrok.log not found or empty."
+            echo "❌ CRITICAL: Failed to retrieve ngrok public URL after $MAX_RETRIES attempts."
+            echo "--- ngrok.log ---"
+            cat ngrok.log || echo "ngrok.log not found."
+            echo "--- api.log ---"
+            cat api.log || echo "api.log not found."
             exit 1
           fi
-          
-          echo "Flask API logs (api.log):"
-          tail -n 20 api.log || echo "api.log not found or empty."
 
-      - name: Keep runner alive
-        run: sleep 3600
+      - name: Keep runner alive for interaction
+        # The runner will stay alive for 1 hour, or until manually cancelled.
+        # This is for testing the ngrok tunnel and chat application.
+        run: sleep 3600 
