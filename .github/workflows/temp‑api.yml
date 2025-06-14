@@ -18,35 +18,99 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y jq
-          pip install flask >/dev/null
+          pip install flask flask-socketio eventlet >/dev/null
 
-      - name: Create a tiny Flask app
+      - name: Create Flask API and dashboard
         run: |
+          mkdir -p static
+          # Flask app
           cat <<'PY' > api.py
-          from flask import Flask, jsonify
-          app = Flask(__name__)
+          from flask import Flask, request, jsonify, send_from_directory
+          from flask_socketio import SocketIO, send
+          import threading, time
 
-          @app.route("/ping")
+          app = Flask(__name__, static_folder='static')
+          socketio = SocketIO(app)
+
+          @app.route('/')
+          def index():
+              return send_from_directory('static', 'index.html')
+
+          @app.route('/ping')
           def ping():
               return jsonify(ok=True)
 
-          if __name__ == "__main__":
-              app.run(host="0.0.0.0", port=8000)
+          @app.route('/echo', methods=['POST'])
+          def echo():
+              data = request.get_json(force=True)
+              app.logger.info(f"Echo: {data}")
+              return jsonify(echo=data)
+
+          @socketio.on('message')
+          def chat(msg):
+              send(msg, broadcast=True)
+
+          def broadcast_logs():
+              pos = 0
+              while True:
+                  with open('api.log') as f:
+                      f.seek(pos)
+                      for line in f:
+                          socketio.emit('log', line)
+                      pos = f.tell()
+                  time.sleep(1)
+
+          if __name__ == '__main__':
+              threading.Thread(target=broadcast_logs, daemon=True).start()
+              socketio.run(app, host='0.0.0.0', port=8000)
           PY
 
-      - name: Start Flask API
-        run: |
-          nohup python api.py &
+          # Dashboard HTML
+          cat <<'HTML' > static/index.html
+          <!doctype html>
+          <html>
+          <head>
+            <title>API Dashboard</title>
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+          </head>
+          <body>
+            <h1>API Dashboard</h1>
+            <div>
+              <input id="msg" placeholder="Type chat" />
+              <button onclick="sendChat()">Send</button>
+            </div>
+            <h2>Chat</h2>
+            <pre id="chat"></pre>
+            <h2>Logs</h2>
+            <pre id="logs"></pre>
+            <script>
+              const socket = io();
+              socket.on('message', m=>{
+                document.getElementById('chat').textContent += m + '\n';
+              });
+              socket.on('log', l=>{
+                document.getElementById('logs').textContent += l;
+              });
+              function sendChat(){
+                const m = document.getElementById('msg').value;
+                socket.send(m);
+                document.getElementById('msg').value = '';
+              }
+            </script>
+          </body>
+          </html>
+          HTML
 
-      - name: Install ngrok and start tunnel
+      - name: Start API and ngrok tunnel
         run: |
+          nohup python api.py > api.log 2>&1 &
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt update && sudo apt install ngrok -y
+          sudo apt update && sudo apt install -y ngrok
           ngrok config add-authtoken "$NGROK_TOKEN"
-          nohup ngrok http 8000 --log=stdout > ngrok.log &
+          nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
           sleep 5
-          curl --silent http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
+          echo "🚀 Public URL: $(curl --silent http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')"
 
       - name: Keep runner alive
         run: sleep 3600
