@@ -26,23 +26,30 @@ jobs:
           # Flask app
           cat <<'PY' > api.py
           from flask import Flask, request, jsonify, send_from_directory
-          from flask_socketio import SocketIO, send
+          from flask_socketio import SocketIO
           import threading, time
-          import logging # Recommended for explicit logging configuration
+          import logging
+          from collections import deque # For potentially limiting history
 
-          # Configure basic logging
           logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
           app = Flask(__name__, static_folder='static', static_url_path='')
-          # Add a logger for Flask app if not using default
           app.logger.setLevel(logging.INFO)
 
           socketio = SocketIO(
               app,
               cors_allowed_origins='*',
-              serve_client=True, # This serves /socket.io/socket.io.js but we're using CDN
+              serve_client=True, 
               async_mode='eventlet'
           )
+
+          # In-memory store for chat history for the current session
+          # For a simple list:
+          chat_history = [] 
+          # Or, for a list with a maximum size (e.g., last 200 messages):
+          # MAX_HISTORY_MESSAGES = 200
+          # chat_history = deque(maxlen=MAX_HISTORY_MESSAGES)
+
 
           @app.route('/')
           def index():
@@ -58,15 +65,45 @@ jobs:
               app.logger.info(f"Echo: {data}")
               return jsonify(echo=data)
 
+          @socketio.on('connect')
+          def handle_connect():
+              sid = request.sid
+              app.logger.info(f"Client connected: {sid}")
+              
+              # Send existing chat history to the newly connected client
+              # Iterate over a copy if using a list, or list(deque) if using deque
+              history_to_send = list(chat_history) # Make a copy to iterate safely
+              for hist_msg in history_to_send:
+                  socketio.emit('message', hist_msg, to=sid)
+              
+              if history_to_send:
+                  socketio.emit('message', "System: Chat history loaded.", to=sid)
+              else:
+                  socketio.emit('message', "System: Welcome! No prior messages in this session.", to=sid)
+
+          @socketio.on('disconnect')
+          def handle_disconnect():
+              sid = request.sid
+              app.logger.info(f"Client disconnected: {sid}")
+              # Optionally, inform other users. If so, consider a different event name
+              # to avoid adding "User left" to chat_history via the 'message' handler.
+              # socketio.emit('user_status', f'User {sid[:5]}... has left.', broadcast=True)
+
+
           @socketio.on('message')
-          def chat(msg):
-              app.logger.info(f"Chat message: {msg}")
-              socketio.emit('message', msg) # Broadcast to all clients
+          def chat(msg_data):
+              sid = request.sid
+              app.logger.info(f"Chat message from client {sid}: {msg_data}")
+              
+              # Add the new message to our in-memory history
+              chat_history.append(msg_data) 
+              
+              # Broadcast the new message to ALL connected clients
+              socketio.emit('message', msg_data, broadcast=True)
+
 
           def broadcast_logs():
-              # Ensure api.log exists, create if not (though nohup redirection should do this)
-              # The 'a' mode creates if not exist, and places pointer at end.
-              # Then, we'll read from beginning if needed or from last known pos.
+              # Ensure api.log exists, create if not
               open('api.log', 'a').close() 
               
               pos = 0
@@ -76,10 +113,9 @@ jobs:
                           f.seek(pos)
                           for line in f:
                               if line.strip(): # Avoid sending empty lines
-                                  socketio.emit('log', line)
+                                  socketio.emit('log', line) # Broadcasts by default
                           pos = f.tell()
                   except FileNotFoundError:
-                      # This case might occur if api.log is deleted during runtime
                       app.logger.warning("api.log not found, will retry.")
                       pos = 0 # Reset position if file is recreated
                   except Exception as e:
@@ -87,16 +123,14 @@ jobs:
                   time.sleep(1)
 
           if __name__ == '__main__':
-              # Start log broadcasting in a background thread
               log_thread = threading.Thread(target=broadcast_logs, daemon=True)
               log_thread.start()
               
               app.logger.info("Starting Flask-SocketIO server on 0.0.0.0:8000")
-              # Use eventlet to run the server
               socketio.run(app, host='0.0.0.0', port=8000)
           PY
 
-          # Dashboard HTML using CDN client
+          # Dashboard HTML using CDN client (no changes needed here from previous correct version)
           cat <<'HTML' > static/index.html
           <!doctype html>
           <html lang="en">
@@ -125,16 +159,12 @@ jobs:
             <h2>Server Logs</h2>
             <pre id="logs" style="height:200px; overflow-y:auto;"></pre>
             
-            <!-- Corrected Socket.IO client CDN URL -->
             <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
             <script>
               document.addEventListener('DOMContentLoaded', ()=>{
                 console.log('Dashboard loaded. Initializing Socket.IO connection...');
-                // Connect to the Socket.IO server (defaults to current host)
-                // Explicitly specifying path and transports can be useful for debugging
                 const socket = io({
-                    // path: '/socket.io', // Default path, usually not needed to specify
-                    transports: ['websocket', 'polling'] // Allow polling as fallback
+                    transports: ['websocket', 'polling'] 
                 });
 
                 const chatPre = document.getElementById('chat');
@@ -144,29 +174,33 @@ jobs:
 
                 socket.on('connect', () => {
                   console.log('Socket.IO connected successfully. SID:', socket.id);
-                  chatPre.textContent += 'System: Connected to server.\n';
+                  // No longer need to add "Connected" message here, server sends history/welcome
+                  // chatPre.textContent += 'System: Connected to server.\n'; 
+                  // chatPre.scrollTop = chatPre.scrollHeight;
                 });
 
                 socket.on('disconnect', (reason) => {
                   console.log('Socket.IO disconnected. Reason:', reason);
                   chatPre.textContent += `System: Disconnected from server. Reason: ${reason}\n`;
+                  chatPre.scrollTop = chatPre.scrollHeight;
                 });
 
                 socket.on('connect_error', (err) => {
                   console.error('Socket.IO connection error:', err);
                   logsPre.textContent += `Socket.IO Connection Error: ${err.message}\n`;
+                  logsPre.scrollTop = logsPre.scrollHeight;
                 });
 
                 socket.on('message', msg => {
+                  // This handler now receives both historical and real-time messages
                   console.log('Received chat message:', msg);
                   chatPre.textContent += msg + '\n';
-                  chatPre.scrollTop = chatPre.scrollHeight; // Auto-scroll
+                  chatPre.scrollTop = chatPre.scrollHeight; 
                 });
 
                 socket.on('log', line => {
-                  // console.log('Received log line:', line); // Can be noisy
-                  logsPre.textContent += line; // Server already sends newlines
-                  logsPre.scrollTop = logsPre.scrollHeight; // Auto-scroll
+                  logsPre.textContent += line; 
+                  logsPre.scrollTop = logsPre.scrollHeight; 
                 });
 
                 sendButton.addEventListener('click', () => {
@@ -174,17 +208,16 @@ jobs:
                   if (message) {
                     console.log('Sending chat message:', message);
                     socket.emit('message', message);
-                    msgInput.value = ''; // Clear input after sending
+                    msgInput.value = ''; 
                   }
                 });
 
                 msgInput.addEventListener('keypress', (event) => {
                     if (event.key === 'Enter') {
-                        event.preventDefault(); // Prevent form submission if it were in a form
+                        event.preventDefault(); 
                         sendButton.click();
                     }
                 });
-
               });
             </script>
           </body>
@@ -193,28 +226,15 @@ jobs:
 
       - name: Start API and ngrok tunnel
         run: |
-          # Start the Flask API in the background, redirecting stdout/stderr to api.log
           nohup python api.py > api.log 2>&1 &
-          
-          # Wait a moment for the Python application to start and potentially create api.log
           sleep 2 
-
-          # Install ngrok
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install -y ngrok
-          
-          # Configure ngrok with auth token
           ngrok config add-authtoken "$NGROK_TOKEN"
-          
-          # Start ngrok tunnel in the background, logging its output to ngrok.log
           nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
-          
-          # Wait for ngrok to establish the tunnel
           sleep 5 
           
-          # Display the public URL
-          # Adding retries or more robust check for ngrok API availability
           NGROK_API_URL="http://localhost:4040/api/tunnels"
           PUBLIC_URL=""
           for i in {1..5}; do
