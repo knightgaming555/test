@@ -30,7 +30,8 @@ jobs:
           import threading, time
 
           app = Flask(__name__, static_folder='static')
-          socketio = SocketIO(app, cors_allowed_origins='*')
+          # force eventlet async
+          socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet')
 
           @app.route('/')
           def index():
@@ -49,7 +50,8 @@ jobs:
           @socketio.on('message')
           def chat(msg):
               app.logger.info(f"Chat message: {msg}")
-              send(msg, broadcast=True)
+              # broadcast to all clients
+              socketio.emit('message', msg)
 
           def broadcast_logs():
               pos = 0
@@ -63,10 +65,11 @@ jobs:
 
           if __name__ == '__main__':
               threading.Thread(target=broadcast_logs, daemon=True).start()
+              # use eventlet
               socketio.run(app, host='0.0.0.0', port=8000)
           PY
 
-          # Dashboard HTML with CDN client
+          # Dashboard HTML using local client
           cat <<'HTML' > static/index.html
           <!doctype html>
           <html lang="en">
@@ -74,7 +77,10 @@ jobs:
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>API Dashboard</title>
-            <link rel="icon" href="#">
+            <style>
+              body { font-family: sans-serif; padding: 1rem; }
+              pre { background: #f5f5f5; padding: 0.5rem; }
+            </style>
           </head>
           <body>
             <h1>API Dashboard</h1>
@@ -83,28 +89,28 @@ jobs:
               <button id="sendBtn">Send</button>
             </div>
             <h2>Chat</h2>
-            <pre id="chat" style="height:200px; overflow:auto; border:1px solid #ccc;"></pre>
+            <pre id="chat" style="height:200px; overflow:auto;"></pre>
             <h2>Logs</h2>
-            <pre id="logs" style="height:200px; overflow:auto; border:1px solid #ccc;"></pre>
-            <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+            <pre id="logs" style="height:200px; overflow:auto;"></pre>
+            <!-- load client from server -->
+            <script src="/socket.io/socket.io.js"></script>
             <script>
               document.addEventListener('DOMContentLoaded', ()=>{
                 console.log('Dashboard loaded');
-                const socket = io();
+                // connect to current origin
+                const socket = io(window.location.origin, { transports: ['websocket', 'polling'] });
                 socket.on('connect', ()=> console.log('Socket connected'));
                 socket.on('message', msg =>{
                   console.log('Received:', msg);
-                  const chat = document.getElementById('chat');
-                  chat.textContent += msg + '\n';
+                  document.getElementById('chat').textContent += msg + '\n';
                 });
                 socket.on('log', line =>{
-                  const logs = document.getElementById('logs');
-                  logs.textContent += line;
+                  document.getElementById('logs').textContent += line;
                 });
                 document.getElementById('sendBtn').addEventListener('click', ()=>{
                   const inp = document.getElementById('msg');
                   console.log('Sending:', inp.value);
-                  socket.send(inp.value);
+                  socket.emit('message', inp.value);
                   inp.value = '';
                 });
               });
@@ -115,11 +121,14 @@ jobs:
 
       - name: Start API and ngrok tunnel
         run: |
+          # launch Flask + SocketIO
           nohup python api.py > api.log 2>&1 &
+          # install ngrok
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install -y ngrok
           ngrok config add-authtoken "$NGROK_TOKEN"
+          # start tunnel
           nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
           sleep 5
           echo "🚀 Public URL: $(curl --silent http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')"
