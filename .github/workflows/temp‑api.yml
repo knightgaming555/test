@@ -1,6 +1,3 @@
-Here’s the full **`.github/workflows/realtime‑chat‑workflow.yml`** file:
-
-```yaml
 name: realtime-chat-workflow
 
 on:
@@ -321,4 +318,3 @@ jobs:
         tail -n 20 ngrok.log || true
         echo "Runner sleeping for manual testing. Open dev‑console for client logs."
         sleep 3600
-```
