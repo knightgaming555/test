@@ -46,26 +46,120 @@ jobs:
       - name: Start ngrok tunnel without warning page
         id: ngrok
         run: |
-          AUTH=""
+          AUTH_ARGS=() # Use an array for optional arguments
           if [[ -n "$NGROK_USERNAME" && -n "$NGROK_PASSWORD" ]]; then
-            AUTH="--basic-auth \"$NGROK_USERNAME:$NGROK_PASSWORD\""
+            # Pass username:password as a single argument for --basic-auth
+            AUTH_ARGS=("--basic-auth" "$NGROK_USERNAME:$NGROK_PASSWORD")
+            echo "Basic authentication will be enabled for the ngrok tunnel."
+          else
+            echo "No NGROK_USERNAME and/or NGROK_PASSWORD provided, basic authentication will be disabled."
           fi
-          nohup ngrok http ${FLASK_PORT} $AUTH \
+
+          echo "Starting ngrok..."
+          # Start ngrok in the background, logging its stdout (which includes its own logs) to ngrok.log
+          # Stderr is also redirected to ngrok.log to capture early ngrok executable errors.
+          nohup ngrok http ${FLASK_PORT} "${AUTH_ARGS[@]}" \
             --request-header "ngrok-skip-browser-warning: true" \
             --request-header "User-Agent: CustomAgent" \
             --log=stdout > ngrok.log 2>&1 &
-          echo $! > ngrok.pid
+          
+          NGROK_PID=$!
+          echo $NGROK_PID > ngrok.pid
+          echo "ngrok process started with PID $NGROK_PID."
+
+          # Give ngrok a moment to initialize its agent and API
+          echo "Waiting 5 seconds for ngrok to initialize..."
+          sleep 5 
+
           URL=""
-          for i in {1..10}; do
-            sleep 3
-            URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
+          API_RESPONSE="" # To store the last API response for debugging
+          CURL_EXIT_CODE=-1 # Initialize curl exit code
+
+          # Increased retries to 15 (total 45 seconds + initial 5s sleep = 50s)
+          for i in {1..15}; do
+            echo "Attempt $i to get ngrok HTTPS URL..."
+
+            # Check if ngrok process is still running
+            if ! kill -0 $NGROK_PID 2>/dev/null; then
+              echo "Error: ngrok process $NGROK_PID is not running." >&2
+              if [[ -f ngrok.log ]]; then
+                echo "--- ngrok.log contents (ngrok process died) ---" >&2
+                cat ngrok.log >&2
+                echo "--- end of ngrok.log ---" >&2
+              else
+                echo "ngrok.log not found." >&2
+              fi
+              exit 1 # ngrok died, no point in continuing
+            fi
+
+            # Try to get the API response from ngrok agent
+            # Use mktemp for temporary storage of curl's stderr
+            CURL_STDERR_FILE=$(mktemp)
+            API_RESPONSE=$(curl --fail -s http://localhost:4040/api/tunnels 2> "$CURL_STDERR_FILE")
+            CURL_EXIT_CODE=$?
+            CURL_STDERR_OUTPUT=$(cat "$CURL_STDERR_FILE")
+            rm "$CURL_STDERR_FILE"
+
+            if [[ $CURL_EXIT_CODE -ne 0 ]]; then
+              echo "Error: curl failed to connect to ngrok API (localhost:4040). Exit code: $CURL_EXIT_CODE" >&2
+              if [[ -n "$CURL_STDERR_OUTPUT" ]]; then
+                  echo "curl stderr: $CURL_STDERR_OUTPUT" >&2
+              fi
+              # ngrok process might be running but API not ready or erroring.
+              # ngrok.log might contain clues about the API status or tunnel issues.
+              if [[ -f ngrok.log ]]; then
+                echo "--- ngrok.log contents (curl failed to connect to API) ---" >&2
+                cat ngrok.log >&2
+                echo "--- end of ngrok.log ---" >&2
+              fi
+            elif [[ -z "$API_RESPONSE" ]]; then
+              # curl succeeded (exit code 0) but returned an empty response.
+              echo "Warning: ngrok API (localhost:4040) returned an empty response." >&2
+            else
+              # API_RESPONSE is not empty, try to parse it
+              # For verbose debugging, you can uncomment the next line:
+              # echo "Raw ngrok API Response: $API_RESPONSE"
+              URL=$(echo "$API_RESPONSE" | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
+            fi
+            
             if [[ -n "$URL" ]]; then
               echo "NGROK_URL=$URL" >> $GITHUB_OUTPUT
-              break
+              echo "Successfully fetched ngrok HTTPS URL: $URL"
+              # Optional: print a few lines of ngrok.log on success for quick verification
+              # if [[ -f ngrok.log ]]; then
+              #   echo "--- Initial ngrok.log (success run) ---"
+              #   head -n 20 ngrok.log || true
+              #   echo "--- end of initial ngrok.log ---"
+              # fi
+              break # Exit loop on success
             fi
+            
+            echo "HTTPS URL not found yet. Waiting 3 seconds before next attempt..."
+            sleep 3
           done
+
+          # After the loop, check if URL was found
           if [[ -z "$URL" ]]; then
-            echo "Could not start ngrok tunnel" >&2
+            echo "Error: Could not obtain HTTPS ngrok tunnel URL after multiple attempts." >&2
+            # Dump all relevant debug information
+            if [[ -f ngrok.log ]]; then
+              echo "--- ngrok.log contents (final failure to get URL) ---" >&2
+              cat ngrok.log >&2
+              echo "--- end of ngrok.log ---" >&2
+            else
+              echo "ngrok.log not found." >&2
+            fi
+
+            if [[ $CURL_EXIT_CODE -ne 0 && $CURL_EXIT_CODE -ne -1 ]]; then # If curl was attempted and failed
+                echo "Last curl attempt to ngrok API failed with exit code: $CURL_EXIT_CODE." >&2
+                if [[ -n "$CURL_STDERR_OUTPUT" ]]; then
+                  echo "Last curl stderr: $CURL_STDERR_OUTPUT" >&2
+                fi
+            elif [[ -n "$API_RESPONSE" ]]; then # If curl succeeded but parsing failed or no HTTPS tunnel
+                echo "Last raw ngrok API response (could not find HTTPS URL): $API_RESPONSE" >&2
+            else # If API_RESPONSE is empty and curl didn't report an error (e.g. if it wasn't even reached properly)
+                echo "No API response was successfully retrieved from ngrok." >&2
+            fi
             exit 1
           fi
 
