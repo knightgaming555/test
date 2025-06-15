@@ -50,14 +50,19 @@ jobs:
           if [[ -n "$NGROK_USERNAME" && -n "$NGROK_PASSWORD" ]]; then
             AUTH="--basic-auth \"$NGROK_USERNAME:$NGROK_PASSWORD\""
           fi
-          # Add request-header to skip warning and custom UA
           nohup ngrok http ${FLASK_PORT} $AUTH \
             --request-header "ngrok-skip-browser-warning: true" \
             --request-header "User-Agent: CustomAgent" \
             --log=stdout > ngrok.log 2>&1 &
           echo $! > ngrok.pid
+          URL=""
           for i in {1..10}; do
-
+            sleep 3
+            URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
+            if [[ -n "$URL" ]]; then
+              echo "NGROK_URL=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
           done
           if [[ -z "$URL" ]]; then
             echo "Could not start ngrok tunnel" >&2
