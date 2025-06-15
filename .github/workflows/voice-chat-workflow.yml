@@ -43,14 +43,15 @@ jobs:
           sudo apt-get install -y ngrok
           ngrok config add-authtoken "$NGROK_TOKEN"
 
-      - name: Start ngrok tunnel
+      - name: Start ngrok tunnel without warning page
         id: ngrok
         run: |
           AUTH=""
           if [[ -n "$NGROK_USERNAME" && -n "$NGROK_PASSWORD" ]]; then
             AUTH="--basic-auth \"$NGROK_USERNAME:$NGROK_PASSWORD\""
           fi
-          nohup ngrok http ${FLASK_PORT} $AUTH --log=stdout > ngrok.log 2>&1 &
+          # Add request-header to skip browser warning on free ngrok
+          nohup ngrok http ${FLASK_PORT} $AUTH --request-header "ngrok-skip-browser-warning: true" --log=stdout > ngrok.log 2>&1 &
           echo $! > ngrok.pid
           for i in {1..10}; do
             sleep 3
