@@ -278,6 +278,18 @@
 
     /* Mobile optimizations */
     @media (max-width: 768px) {
+      .control-buttons {
+  flex-wrap: nowrap;
+  flex-direction: row;
+}
+.pill-button {
+  flex: 1;
+  min-width: 0;
+  padding: 0.4rem 0.6rem; /* you already have similar, but ensure it */
+  font-size: 0.7rem;
+}
+
+      
       .container {
         padding: 0.5rem;
       }
@@ -308,18 +320,6 @@
         width: min(200px, 50vw);
         height: min(200px, 50vw);
         margin: 1rem 0;
-      }
-
-      .control-buttons {
-        bottom: 0.5rem;
-        gap: 0.3rem;
-      }
-
-      .pill-button {
-        padding: 0.45rem 0.7rem;
-        font-size: 0.75rem;
-        flex: 1;
-        min-width: 0;
       }
 
       .local-video {
