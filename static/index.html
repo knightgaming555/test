@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17,10 +16,12 @@
       color: #ffffff;
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
       height: 100vh;
+      height: 100dvh;
       overflow: hidden;
       display: flex;
       align-items: center;
       justify-content: center;
+      position: relative;
     }
 
     .container {
@@ -31,28 +32,40 @@
       align-items: center;
       justify-content: center;
       position: relative;
+      padding: 1rem;
+      max-width: 100vw;
+      max-height: 100vh;
     }
 
     .room-input-section {
       position: absolute;
-      top: 3rem;
+      top: 1rem;
+      left: 50%;
+      transform: translateX(-50%);
       display: flex;
       align-items: center;
-      gap: 1rem;
+      gap: 0.5rem;
       z-index: 10;
+      flex-wrap: wrap;
+      justify-content: center;
+      width: 100%;
+      max-width: 90vw;
+      padding: 0 1rem;
     }
 
     .room-input {
       background: rgba(255, 255, 255, 0.1);
       border: 2px solid rgba(59, 130, 246, 0.3);
-      border-radius: 50px;
-      padding: 0.75rem 1.5rem;
+      border-radius: 25px;
+      padding: 0.6rem 1rem;
       color: white;
-      font-size: 1rem;
+      font-size: 0.9rem;
       outline: none;
       backdrop-filter: blur(10px);
       transition: all 0.3s ease;
-      min-width: 200px;
+      min-width: 150px;
+      max-width: 200px;
+      flex: 1;
     }
 
     .room-input:focus {
@@ -67,8 +80,8 @@
     .pill-button {
       background: linear-gradient(135deg, #3b82f6, #1d4ed8);
       border: none;
-      border-radius: 50px;
-      padding: 0.75rem 1.5rem;
+      border-radius: 25px;
+      padding: 0.6rem 1rem;
       color: white;
       font-weight: 600;
       cursor: pointer;
@@ -76,11 +89,18 @@
       backdrop-filter: blur(10px);
       position: relative;
       overflow: hidden;
+      font-size: 0.85rem;
+      white-space: nowrap;
+      min-width: 70px;
     }
 
     .pill-button:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 10px 25px rgba(59, 130, 246, 0.4);
+      transform: translateY(-1px);
+      box-shadow: 0 5px 15px rgba(59, 130, 246, 0.4);
+    }
+
+    .pill-button:active {
+      transform: translateY(0);
     }
 
     .pill-button:disabled {
@@ -96,12 +116,12 @@
     }
 
     .pill-button.leave:hover {
-      box-shadow: 0 10px 25px rgba(239, 68, 68, 0.4);
+      box-shadow: 0 5px 15px rgba(239, 68, 68, 0.4);
     }
 
     .central-circle {
-      width: 300px;
-      height: 300px;
+      width: min(280px, 70vw);
+      height: min(280px, 70vw);
       border-radius: 50%;
       background: radial-gradient(circle, rgba(59, 130, 246, 0.1), rgba(59, 130, 246, 0.05));
       border: 3px solid rgba(59, 130, 246, 0.4);
@@ -113,47 +133,56 @@
         0 0 50px rgba(59, 130, 246, 0.3),
         inset 0 0 50px rgba(59, 130, 246, 0.1);
       transition: all 0.3s ease;
+      margin: 2rem 0;
     }
 
     .audio-visualizer {
-      width: 200px;
-      height: 200px;
+      width: 70%;
+      height: 70%;
       position: relative;
       display: flex;
       align-items: center;
       justify-content: center;
+      gap: 3px;
     }
 
     .wave {
-      position: absolute;
-      width: 4px;
+      width: 3px;
       background: linear-gradient(to top, #3b82f6, #60a5fa);
       border-radius: 2px;
       animation: wave 1s ease-in-out infinite alternate;
       opacity: 0.8;
+      min-height: 15px;
     }
 
     @keyframes wave {
-      0% { height: 20px; }
-      100% { height: 60px; }
+      0% { height: 15px; }
+      100% { height: 40px; }
     }
 
     .control-buttons {
       position: absolute;
-      bottom: 3rem;
+      bottom: 1rem;
+      left: 50%;
+      transform: translateX(-50%);
       display: flex;
-      gap: 1rem;
+      gap: 0.5rem;
       z-index: 10;
+      flex-wrap: wrap;
+      justify-content: center;
+      width: 100%;
+      max-width: 90vw;
+      padding: 0 1rem;
     }
 
     .local-video {
       position: absolute;
-      bottom: 2rem;
-      right: 2rem;
-      width: 200px;
-      height: 150px;
-      border-radius: 15px;
-      border: 3px solid rgba(59, 130, 246, 0.6);
+      bottom: 5rem;
+      right: 1rem;
+      width: min(180px, 25vw);
+      height: min(135px, 19vw);
+      border-radius: 12px;
+      border: 2px solid rgba(59, 130, 246, 0.6);
       object-fit: cover;
       box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
       transform: scale(0);
@@ -192,6 +221,9 @@
       z-index: 5;
       opacity: 0;
       transition: opacity 0.5s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .screen-share.visible {
@@ -202,10 +234,10 @@
       position: absolute;
       top: 1rem;
       right: 1rem;
-      padding: 0.5rem 1rem;
+      padding: 0.4rem 0.8rem;
       background: rgba(0, 0, 0, 0.7);
-      border-radius: 20px;
-      font-size: 0.9rem;
+      border-radius: 15px;
+      font-size: 0.8rem;
       backdrop-filter: blur(10px);
       z-index: 10;
     }
@@ -218,15 +250,13 @@
       color: #ef4444;
     }
 
-    /* Pulsing glow effect for active audio */
     .central-circle.active {
       box-shadow: 
-        0 0 100px rgba(59, 130, 246, 0.6),
+        0 0 80px rgba(59, 130, 246, 0.6),
         inset 0 0 50px rgba(59, 130, 246, 0.2);
       border-color: rgba(59, 130, 246, 0.8);
     }
 
-    /* Background particles */
     .bg-particle {
       position: absolute;
       background: rgba(59, 130, 246, 0.1);
@@ -237,17 +267,127 @@
 
     @keyframes float {
       0%, 100% { transform: translateY(0px) rotate(0deg); }
-      50% { transform: translateY(-20px) rotate(180deg); }
+      50% { transform: translateY(-15px) rotate(180deg); }
+    }
+
+    /* Mobile optimizations */
+    @media (max-width: 768px) {
+      .container {
+        padding: 0.5rem;
+      }
+
+      .room-input-section {
+        top: 0.5rem;
+        gap: 0.3rem;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      .room-input {
+        width: 100%;
+        max-width: 250px;
+        margin-bottom: 0.3rem;
+      }
+
+      .room-buttons {
+        display: flex;
+        gap: 0.5rem;
+        width: 100%;
+        justify-content: center;
+      }
+
+      .central-circle {
+        width: min(250px, 60vw);
+        height: min(250px, 60vw);
+        margin: 1rem 0;
+      }
+
+      .control-buttons {
+        bottom: 0.5rem;
+        gap: 0.3rem;
+      }
+
+      .pill-button {
+        padding: 0.5rem 0.8rem;
+        font-size: 0.8rem;
+        flex: 1;
+        min-width: 0;
+      }
+
+      .local-video {
+        bottom: 4rem;
+        right: 0.5rem;
+        width: min(120px, 30vw);
+        height: min(90px, 23vw);
+      }
+
+      .status-indicator {
+        top: 0.5rem;
+        right: 0.5rem;
+        padding: 0.3rem 0.6rem;
+        font-size: 0.7rem;
+      }
+
+      .wave {
+        width: 2px;
+        gap: 2px;
+      }
+
+      @keyframes wave {
+        0% { height: 10px; }
+        100% { height: 25px; }
+      }
+    }
+
+    @media (max-width: 480px) {
+      .central-circle {
+        width: min(200px, 55vw);
+        height: min(200px, 55vw);
+      }
+
+      .pill-button {
+        padding: 0.4rem 0.6rem;
+        font-size: 0.75rem;
+      }
+
+      .local-video {
+        width: min(100px, 25vw);
+        height: min(75px, 19vw);
+        bottom: 3.5rem;
+      }
+    }
+
+    /* Landscape mobile */
+    @media (max-height: 500px) and (orientation: landscape) {
+      .room-input-section {
+        top: 0.3rem;
+      }
+
+      .central-circle {
+        width: min(150px, 25vh);
+        height: min(150px, 25vh);
+        margin: 0.5rem 0;
+      }
+
+      .control-buttons {
+        bottom: 0.3rem;
+      }
+
+      .local-video {
+        bottom: 2.5rem;
+        width: min(100px, 20vw);
+        height: min(75px, 15vw);
+      }
     }
   </style>
 </head>
 <body>
   <div class="container">
     <!-- Background particles -->
-    <div class="bg-particle" style="width: 8px; height: 8px; top: 20%; left: 10%; animation-delay: -2s;"></div>
-    <div class="bg-particle" style="width: 6px; height: 6px; top: 60%; left: 80%; animation-delay: -4s;"></div>
-    <div class="bg-particle" style="width: 10px; height: 10px; top: 80%; left: 20%; animation-delay: -1s;"></div>
-    <div class="bg-particle" style="width: 4px; height: 4px; top: 30%; right: 15%; animation-delay: -3s;"></div>
+    <div class="bg-particle" style="width: 6px; height: 6px; top: 20%; left: 10%; animation-delay: -2s;"></div>
+    <div class="bg-particle" style="width: 4px; height: 4px; top: 60%; left: 80%; animation-delay: -4s;"></div>
+    <div class="bg-particle" style="width: 8px; height: 8px; top: 80%; left: 20%; animation-delay: -1s;"></div>
+    <div class="bg-particle" style="width: 3px; height: 3px; top: 30%; right: 15%; animation-delay: -3s;"></div>
 
     <div class="status-indicator disconnected" id="statusIndicator">
       Disconnected
@@ -255,8 +395,10 @@
 
     <div class="room-input-section">
       <input type="text" class="room-input" id="roomInput" placeholder="Enter room name">
-      <button class="pill-button" id="joinBtn">Join</button>
-      <button class="pill-button leave" id="leaveBtn" disabled>Leave</button>
+      <div class="room-buttons">
+        <button class="pill-button" id="joinBtn">Join</button>
+        <button class="pill-button leave" id="leaveBtn" disabled>Leave</button>
+      </div>
     </div>
 
     <div class="central-circle" id="centralCircle">
@@ -267,7 +409,7 @@
 
     <div class="control-buttons">
       <button class="pill-button" id="toggleCamBtn" disabled>📹 Camera</button>
-      <button class="pill-button" id="shareScreenBtn" disabled>🖥️ Share Screen</button>
+      <button class="pill-button" id="shareScreenBtn" disabled>🖥️ Share</button>
     </div>
 
     <video class="remote-video" id="remoteVideo" autoplay playsinline></video>
