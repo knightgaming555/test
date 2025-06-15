@@ -1,4 +1,4 @@
- const socket = io();
+const socket = io();
     let localStream;
     let peers = {};
     let audioContext;
@@ -6,6 +6,7 @@
     let dataArray;
     let animationId;
     let isScreenSharing = false;
+    let isMobile = window.innerWidth <= 768;
 
     const roomInput = document.getElementById('roomInput');
     const joinBtn = document.getElementById('joinBtn');
@@ -19,6 +20,33 @@
     const audioVisualizer = document.getElementById('audioVisualizer');
     const statusIndicator = document.getElementById('statusIndicator');
 
+    // Optimized constraints for better performance
+    const getVideoConstraints = (isMobile, isScreen = false) => {
+      if (isScreen) {
+        return isMobile ? {
+          width: { max: 1280 },
+          height: { max: 720 },
+          frameRate: { max: 15 }
+        } : {
+          width: { max: 1920 },
+          height: { max: 1080 },
+          frameRate: { max: 30 }
+        };
+      }
+      
+      return isMobile ? {
+        width: { ideal: 640, max: 720 },
+        height: { ideal: 480, max: 540 },
+        frameRate: { ideal: 15, max: 24 },
+        facingMode: 'user'
+      } : {
+        width: { ideal: 1280, max: 1920 },
+        height: { ideal: 720, max: 1080 },
+        frameRate: { ideal: 30 },
+        facingMode: 'user'
+      };
+    };
+
     function initAudioVisualization(stream) {
       try {
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -26,7 +54,7 @@
         const source = audioContext.createMediaStreamSource(stream);
         
         source.connect(analyser);
-        analyser.fftSize = 128;
+        analyser.fftSize = 64; // Reduced for better performance
         
         const bufferLength = analyser.frequencyBinCount;
         dataArray = new Uint8Array(bufferLength);
@@ -41,8 +69,7 @@
 
     function createWaves() {
       audioVisualizer.innerHTML = '';
-      const isMobile = window.innerWidth <= 768;
-      const waveCount = isMobile ? 12 : 16;
+      const waveCount = isMobile ? 8 : 12; // Reduced for better performance
       
       for (let i = 0; i < waveCount; i++) {
         const wave = document.createElement('div');
@@ -54,14 +81,13 @@
 
     function createStaticWaves() {
       audioVisualizer.innerHTML = '';
-      const isMobile = window.innerWidth <= 768;
-      const waveCount = isMobile ? 12 : 16;
+      const waveCount = isMobile ? 8 : 12;
       
       for (let i = 0; i < waveCount; i++) {
         const wave = document.createElement('div');
         wave.className = 'wave';
         wave.style.animationDelay = `${i * 0.1}s`;
-        wave.style.height = `${15 + Math.random() * 25}px`;
+        wave.style.height = `${(isMobile ? 8 : 15) + Math.random() * (isMobile ? 12 : 25)}px`;
         audioVisualizer.appendChild(wave);
       }
     }
@@ -76,8 +102,8 @@
       
       waves.forEach((wave, index) => {
         const amplitude = dataArray[index * 2] || 0;
-        const minHeight = window.innerWidth <= 768 ? 10 : 15;
-        const maxHeight = window.innerWidth <= 768 ? 25 : 40;
+        const minHeight = isMobile ? 8 : 15;
+        const maxHeight = isMobile ? 20 : 40;
         const height = Math.max(minHeight, (amplitude / 255) * maxHeight);
         wave.style.height = `${height}px`;
         maxAmplitude = Math.max(maxAmplitude, amplitude);
@@ -95,24 +121,46 @@
     async function startMedia(video = true, screen = false) {
       try {
         if (screen) {
-          return await navigator.mediaDevices.getDisplayMedia({ 
-            video: true, 
-            audio: true 
-          });
+          const constraints = {
+            video: getVideoConstraints(isMobile, true),
+            audio: true
+          };
+          return await navigator.mediaDevices.getDisplayMedia(constraints);
         }
-        return await navigator.mediaDevices.getUserMedia({ 
-          audio: true, 
-          video: video ? { 
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: 'user'
-          } : false
-        });
+        
+        const constraints = {
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: isMobile ? 16000 : 48000
+          },
+          video: video ? getVideoConstraints(isMobile) : false
+        };
+        
+        return await navigator.mediaDevices.getUserMedia(constraints);
       } catch (e) {
         alert('Media access denied. Please allow camera and microphone access.');
         throw e;
       }
     }
+
+    // Optimized peer configuration
+    const getPeerConfig = () => ({
+      initiator: false,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:global.stun.twilio.com:3478' }
+        ]
+      },
+      sdpTransform: (sdp) => {
+        // Optimize bandwidth for mobile
+        if (isMobile) {
+          sdp = sdp.replace(/b=AS:\d+/g, 'b=AS:500'); // Limit to 500kbps
+        }
+        return sdp;
+      }
+    });
 
     joinBtn.onclick = async () => {
       const room = roomInput.value.trim();
@@ -126,7 +174,12 @@
         localVideo.srcObject = localStream;
         localVideo.classList.add('visible');
         
-        initAudioVisualization(localStream);
+        // Only initialize audio visualization if not on mobile for performance
+        if (!isMobile) {
+          initAudioVisualization(localStream);
+        } else {
+          createStaticWaves();
+        }
         
         toggleCamBtn.disabled = false;
         shareScreenBtn.disabled = false;
@@ -171,6 +224,7 @@
           
           const screenTrack = screenStream.getVideoTracks()[0];
           
+          // Replace video track for all peers
           Object.values(peers).forEach(peer => {
             const sender = peer._pc.getSenders().find(s => 
               s.track && s.track.kind === 'video'
@@ -182,9 +236,10 @@
           
           screenTrack.onended = () => {
             screenShare.classList.remove('visible');
-            shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Share' : '🖥️ Share Screen';
+            shareScreenBtn.textContent = '🖥️ Share';
             isScreenSharing = false;
             
+            // Restore camera track
             const videoTrack = localStream.getVideoTracks()[0];
             Object.values(peers).forEach(peer => {
               const sender = peer._pc.getSenders().find(s => 
@@ -196,7 +251,7 @@
             });
           };
           
-          shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Stop' : '🖥️ Stop Share';
+          shareScreenBtn.textContent = '🖥️ Stop';
           isScreenSharing = true;
         } else {
           const screenStream = screenShare.srcObject;
@@ -204,7 +259,7 @@
             screenStream.getTracks().forEach(track => track.stop());
           }
           screenShare.classList.remove('visible');
-          shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Share' : '🖥️ Share Screen';
+          shareScreenBtn.textContent = '🖥️ Share';
           isScreenSharing = false;
         }
       } catch (error) {
@@ -246,7 +301,7 @@
       roomInput.disabled = false;
       
       toggleCamBtn.textContent = '📹 Camera';
-      shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Share' : '🖥️ Share Screen';
+      shareScreenBtn.textContent = '🖥️ Share';
       
       statusIndicator.textContent = 'Disconnected';
       statusIndicator.className = 'status-indicator disconnected';
@@ -257,16 +312,11 @@
 
     socket.on('room_users', users => {
       users.filter(id => id !== socket.id).forEach(sid => {
-        const peer = new SimplePeer({ 
-          initiator: true, 
-          stream: localStream,
-          config: {
-            iceServers: [
-              { urls: 'stun:stun.l.google.com:19302' },
-              { urls: 'stun:global.stun.twilio.com:3478' }
-            ]
-          }
-        });
+        const config = getPeerConfig();
+        config.initiator = true;
+        config.stream = localStream;
+        
+        const peer = new SimplePeer(config);
         setupPeer(peer, sid);
         peers[sid] = peer;
       });
@@ -277,16 +327,11 @@
 
     socket.on('signal', ({ from, signal }) => {
       if (!peers[from]) {
-        const peer = new SimplePeer({ 
-          initiator: false, 
-          stream: localStream,
-          config: {
-            iceServers: [
-              { urls: 'stun:stun.l.google.com:19302' },
-              { urls: 'stun:global.stun.twilio.com:3478' }
-            ]
-          }
-        });
+        const config = getPeerConfig();
+        config.initiator = false;
+        config.stream = localStream;
+        
+        const peer = new SimplePeer(config);
         setupPeer(peer, from);
         peers[from] = peer;
         peer.signal(signal);
@@ -329,12 +374,14 @@
     // Handle orientation changes
     window.addEventListener('orientationchange', () => {
       setTimeout(() => {
+        isMobile = window.innerWidth <= 768;
         createWaves();
       }, 100);
     });
 
     // Handle resize
     window.addEventListener('resize', () => {
+      isMobile = window.innerWidth <= 768;
       if (audioVisualizer.children.length > 0) {
         createWaves();
       }
