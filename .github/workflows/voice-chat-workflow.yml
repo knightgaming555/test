@@ -4,13 +4,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  signaling_server:
+  signaling_and_tunnel:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       FLASK_PORT: 8000
       LOG_LEVEL: INFO
+      NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      NGROK_USERNAME: ${{ secrets.NGROK_APP_USERNAME }}
+      NGROK_PASSWORD: ${{ secrets.NGROK_APP_PASSWORD }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,16 +23,56 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Install server deps
         run: |
           python -m pip install --upgrade pip
           pip install flask==3.0.3 flask-socketio==5.3.6 eventlet==0.35.2 gunicorn==22.0.0
 
-      - name: Start signaling server
+      - name: Launch signaling server
         run: |
-          nohup gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:${FLASK_PORT} signaling:app &
+          nohup gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:${FLASK_PORT} signaling:app > server.log 2>&1 &
+          echo $! > server.pid
           sleep 5
           curl --fail http://localhost:${FLASK_PORT}/ping
 
-      - name: Output server URL
-        run: echo "Signaling server listening on port ${FLASK_PORT}"
+      - name: Install ngrok
+        run: |
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -y
+          sudo apt-get install -y ngrok
+          ngrok config add-authtoken "$NGROK_TOKEN"
+
+      - name: Start ngrok tunnel
+        id: ngrok
+        run: |
+          AUTH=""
+          if [[ -n "$NGROK_USERNAME" && -n "$NGROK_PASSWORD" ]]; then
+            AUTH="--basic-auth \"$NGROK_USERNAME:$NGROK_PASSWORD\""
+          fi
+          nohup ngrok http ${FLASK_PORT} $AUTH --log=stdout > ngrok.log 2>&1 &
+          echo $! > ngrok.pid
+          for i in {1..10}; do
+            sleep 3
+            URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
+            if [[ -n "$URL" ]]; then
+              echo "NGROK_URL=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
+          done
+          if [[ -z "$URL" ]]; then
+            echo "Could not start ngrok tunnel" >&2
+            exit 1
+          fi
+
+      - name: Show live URL
+        run: |
+          echo "Voice chat live at: ${{ steps.ngrok.outputs.NGROK_URL }}"
+          tail -f server.log ngrok.log
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Stopping processes..."
+          kill $(cat server.pid) 2>/dev/null || true
+          kill $(cat ngrok.pid) 2>/dev/null || true
