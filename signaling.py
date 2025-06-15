@@ -1,6 +1,6 @@
 import os
 import logging
-from flask import Flask, jsonify, send_from_directory, request, make_response
+from flask import Flask, jsonify, send_from_directory, request
 from flask_socketio import SocketIO, emit
 import eventlet
 
@@ -37,16 +37,13 @@ def on_join(data):
 
 @socketio.on('signal')
 def on_signal(data):
-    target = data.get('to')
-    sig = data.get('signal')
-    emit('signal', {'from': request.sid, 'signal': sig}, to=target)
-    log.info(f"Signaling from {request.sid} to {target}")
+    emit('signal', {'from': request.sid, 'signal': data.get('signal')}, to=data.get('to'))
+    log.info(f"Signal {request.sid} -> {data.get('to')}")
 
 @socketio.on('leave_room')
 def on_leave(data):
-    room = data.get('room')
-    rooms.get(room, set()).discard(request.sid)
-    log.info(f"{request.sid} left room {room}")
+    rooms.get(data.get('room'), set()).discard(request.sid)
+    log.info(f"{request.sid} left room {data.get('room')}")
 
 @socketio.on('disconnect')
 def on_disconnect():
