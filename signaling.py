@@ -1,13 +1,16 @@
-import os, time, threading, logging
-from flask import Flask, jsonify, send_from_directory, request
+import os
+import logging
+from flask import Flask, jsonify, send_from_directory, request, make_response
 from flask_socketio import SocketIO, emit
 import eventlet
 
 eventlet.monkey_patch()
 
 # Logging
-logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO').upper(),
-                    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO').upper(),
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
 log = logging.getLogger('voice_signaling')
 
 # App setup
@@ -20,7 +23,6 @@ rooms = {}  # room_id: set(sid)
 def ping():
     return jsonify(ok=True)
 
-# Serve client
 @app.route('/')
 def index():
     return send_from_directory('static', 'index.html')
@@ -35,7 +37,6 @@ def on_join(data):
 
 @socketio.on('signal')
 def on_signal(data):
-    # data: {to: sid, from: sid, signal: {...}}
     target = data.get('to')
     sig = data.get('signal')
     emit('signal', {'from': request.sid, 'signal': sig}, to=target)
@@ -44,26 +45,17 @@ def on_signal(data):
 @socketio.on('leave_room')
 def on_leave(data):
     room = data.get('room')
-    sid = request.sid
-    if room in rooms:
-        rooms[room].discard(sid)
-        log.info(f"{sid} left room {room}")
+    rooms.get(room, set()).discard(request.sid)
+    log.info(f"{request.sid} left room {room}")
 
 @socketio.on('disconnect')
 def on_disconnect():
-    sid = request.sid
-    for room, members in rooms.items():
-        if sid in members:
-            members.remove(sid)
-            log.info(f"{sid} disconnected from room {room}")
-
-@app.before_request
-def before_request():
-    # This helps with some automated tools but won't eliminate the browser warning
-    pass
+    for members in rooms.values():
+        members.discard(request.sid)
+    log.info(f"{request.sid} disconnected")
 
 @app.after_request
-def after_request(response):
+def add_skip_warning_header(response):
     response.headers['ngrok-skip-browser-warning'] = 'true'
     return response
 
