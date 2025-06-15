@@ -57,5 +57,15 @@ def on_disconnect():
             members.remove(sid)
             log.info(f"{sid} disconnected from room {room}")
 
+@app.before_request
+def before_request():
+    # This helps with some automated tools but won't eliminate the browser warning
+    pass
+
+@app.after_request
+def after_request(response):
+    response.headers['ngrok-skip-browser-warning'] = 'true'
+    return response
+
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=8000)
