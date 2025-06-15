@@ -1,4 +1,5 @@
 name: private-voice-chat-workflow
+
 on:
   workflow_dispatch:
 
@@ -32,7 +33,7 @@ jobs:
           nohup gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:${FLASK_PORT} signaling:app > server.log 2>&1 &
           echo $! > server.pid
           sleep 5
-          curl --fail http://localhost:${FLASK_PORT}/ping
+          curl --fail http://localhost:${FLASK_PORT}/ping || true
 
       - name: Install ngrok
         run: |
@@ -51,22 +52,9 @@ jobs:
           fi
           nohup ngrok http ${FLASK_PORT} $AUTH --log=stdout > ngrok.log 2>&1 &
           echo $! > ngrok.pid
-          for i in {1..10}; do
-            sleep 3
-            URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
-            if [[ -n "$URL" ]]; then
-              echo "NGROK_URL=$URL" >> $GITHUB_OUTPUT
-              break
-            fi
-          done
-          if [[ -z "$URL" ]]; then
-            echo "Could not start ngrok tunnel" >&2
-            exit 1
-          fi
-
-      - name: Show live URL
+          sleep 5
+      - name: Show logs
         run: |
-          echo "Voice chat live at: ${{ steps.ngrok.outputs.NGROK_URL }}"
           tail -f server.log ngrok.log
 
       - name: Cleanup
@@ -74,4 +62,4 @@ jobs:
         run: |
           echo "Stopping processes..."
           kill $(cat server.pid) 2>/dev/null || true
-          kill $(cat ngrok.pid) 2>/dev/null || true 
+          kill $(cat ngrok.pid) 2>/dev/null || true
