@@ -8,11 +8,18 @@ const leaveBtn = document.getElementById('leaveBtn');
 
 // get user media
 async function initMedia() {
-  localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  if (!localStream) {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      console.error('Error accessing microphone:', err);
+      alert('Could not access microphone.');
+    }
+  }
 }
 
 // join room
-yoinBtn.addEventListener('click', async () => {
+joinBtn.addEventListener('click', async () => {
   await initMedia();
   const room = roomInput.value.trim();
   if (!room) return;
