@@ -13,12 +13,25 @@ const socket = io();
     const leaveBtn = document.getElementById('leaveBtn');
     const toggleCamBtn = document.getElementById('toggleCamBtn');
     const shareScreenBtn = document.getElementById('shareScreenBtn');
+    const toggleMicBtn = document.getElementById('toggleMicBtn');
+    const toggleUIBtn = document.getElementById('toggleUIBtn');
     const localVideo = document.getElementById('localVideo');
     const remoteVideo = document.getElementById('remoteVideo');
     const screenShare = document.getElementById('screenShare');
     const centralCircle = document.getElementById('centralCircle');
     const audioVisualizer = document.getElementById('audioVisualizer');
     const statusIndicator = document.getElementById('statusIndicator');
+
+    const uiSections = [
+  document.querySelector('.room-input-section'),
+  document.querySelector('.control-buttons'),
+  document.getElementById('statusIndicator'),
+  document.getElementById('centralCircle')
+];
+
+    toggleUIBtn.onclick = () => {
+  uiSections.forEach(el => el.classList.toggle('hidden-ui'));
+};
 
     // Optimized constraints for better performance
     const getVideoConstraints = (isMobile, isScreen = false) => {
@@ -182,6 +195,7 @@ const socket = io();
         }
         
         toggleCamBtn.disabled = false;
+        toggleMicBtn.disabled = false;
         shareScreenBtn.disabled = false;
         joinBtn.disabled = true;
         leaveBtn.disabled = false;
@@ -197,6 +211,13 @@ const socket = io();
         statusIndicator.className = 'status-indicator disconnected';
       }
     };
+
+    toggleMicBtn.onclick = () => {
+  const audioTrack = localStream.getAudioTracks()[0];
+  if (!audioTrack) return;
+  audioTrack.enabled = !audioTrack.enabled;
+  toggleMicBtn.textContent = audioTrack.enabled ? '🎤 Mic' : '🔇 Mic';
+};
 
     toggleCamBtn.onclick = async () => {
       if (!localStream) return;
