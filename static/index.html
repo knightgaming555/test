@@ -3,277 +3,34 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Black Ops Voice Chat</title>
+  <title>Black Ops Chat & Share</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-
-    body {
-      background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #16213e 100%);
-      color: #ffffff;
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      height: 100vh;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .container {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 3rem;
-      z-index: 10;
-    }
-
-    .controls {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 1.5rem;
-    }
-
-    .input-group {
-      display: flex;
-      gap: 1rem;
-      align-items: center;
-    }
-
-    #roomInput {
-      padding: 0.75rem 1.5rem;
-      border: 2px solid rgba(59, 130, 246, 0.3);
-      border-radius: 50px;
-      background: rgba(15, 23, 42, 0.8);
-      color: white;
-      font-size: 1rem;
-      outline: none;
-      transition: all 0.3s ease;
-      backdrop-filter: blur(10px);
-      min-width: 200px;
-    }
-
-    #roomInput:focus {
-      border-color: rgba(59, 130, 246, 0.8);
-      box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
-    }
-
-    #roomInput::placeholder {
-      color: rgba(255, 255, 255, 0.5);
-    }
-
-    .button-group {
-      display: flex;
-      gap: 1rem;
-    }
-
-    button {
-      padding: 0.75rem 2rem;
-      border: none;
-      border-radius: 50px;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.3s ease;
-      backdrop-filter: blur(10px);
-      position: relative;
-      overflow: hidden;
-    }
-
-    #joinBtn {
-      background: linear-gradient(135deg, #3b82f6, #1d4ed8);
-      color: white;
-      box-shadow: 0 4px 15px rgba(59, 130, 246, 0.4);
-    }
-
-    #joinBtn:hover:not(:disabled) {
-      transform: translateY(-2px);
-      box-shadow: 0 8px 25px rgba(59, 130, 246, 0.6);
-    }
-
-    #joinBtn:disabled {
-      background: rgba(75, 85, 99, 0.5);
-      cursor: not-allowed;
-      box-shadow: none;
-    }
-
-    #leaveBtn {
-      background: linear-gradient(135deg, #ef4444, #dc2626);
-      color: white;
-      box-shadow: 0 4px 15px rgba(239, 68, 68, 0.4);
-    }
-
-    #leaveBtn:hover:not(:disabled) {
-      transform: translateY(-2px);
-      box-shadow: 0 8px 25px rgba(239, 68, 68, 0.6);
-    }
-
-    #leaveBtn:disabled {
-      background: rgba(75, 85, 99, 0.5);
-      cursor: not-allowed;
-      box-shadow: none;
-    }
-
-    .audio-visualizer {
-      width: 300px;
-      height: 300px;
-      border-radius: 50%;
-      background: radial-gradient(circle, rgba(59, 130, 246, 0.1) 0%, rgba(59, 130, 246, 0.05) 70%, transparent 100%);
-      border: 2px solid rgba(59, 130, 246, 0.3);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      position: relative;
-      box-shadow: 
-        0 0 50px rgba(59, 130, 246, 0.2),
-        inset 0 0 50px rgba(59, 130, 246, 0.1);
-      animation: pulse 2s ease-in-out infinite alternate;
-    }
-
-    @keyframes pulse {
-      0% {
-        box-shadow: 
-          0 0 50px rgba(59, 130, 246, 0.2),
-          inset 0 0 50px rgba(59, 130, 246, 0.1);
-      }
-      100% {
-        box-shadow: 
-          0 0 80px rgba(59, 130, 246, 0.4),
-          inset 0 0 80px rgba(59, 130, 246, 0.2);
-      }
-    }
-
-    .wave-container {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 4px;
-      height: 100px;
-    }
-
-    .wave-bar {
-      width: 4px;
-      background: linear-gradient(to top, #3b82f6, #60a5fa);
-      border-radius: 2px;
-      animation: wave 1s ease-in-out infinite;
-      opacity: 0.3;
-    }
-
-    .wave-bar.active {
-      opacity: 1;
-      box-shadow: 0 0 10px rgba(59, 130, 246, 0.8);
-    }
-
-    .wave-bar:nth-child(1) { height: 20px; animation-delay: 0.1s; }
-    .wave-bar:nth-child(2) { height: 35px; animation-delay: 0.2s; }
-    .wave-bar:nth-child(3) { height: 50px; animation-delay: 0.3s; }
-    .wave-bar:nth-child(4) { height: 45px; animation-delay: 0.4s; }
-    .wave-bar:nth-child(5) { height: 60px; animation-delay: 0.5s; }
-    .wave-bar:nth-child(6) { height: 35px; animation-delay: 0.6s; }
-    .wave-bar:nth-child(7) { height: 50px; animation-delay: 0.7s; }
-    .wave-bar:nth-child(8) { height: 40px; animation-delay: 0.8s; }
-    .wave-bar:nth-child(9) { height: 25px; animation-delay: 0.9s; }
-
-    @keyframes wave {
-      0%, 100% {
-        transform: scaleY(1);
-      }
-      50% {
-        transform: scaleY(1.5);
-      }
-    }
-
-    .status-indicator {
-      position: absolute;
-      top: -10px;
-      right: -10px;
-      width: 20px;
-      height: 20px;
-      border-radius: 50%;
-      background: #10b981;
-      box-shadow: 0 0 10px #10b981;
-      display: none;
-    }
-
-    .status-indicator.connected {
-      display: block;
-      animation: blink 2s ease-in-out infinite;
-    }
-
-    @keyframes blink {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.3; }
-    }
-
-    .background-effect {
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-      opacity: 0.1;
-      z-index: 1;
-    }
-
-    .particle {
-      position: absolute;
-      width: 2px;
-      height: 2px;
-      background: #3b82f6;
-      border-radius: 50%;
-      animation: float 6s ease-in-out infinite;
-    }
-
-    @keyframes float {
-      0%, 100% {
-        transform: translateY(0px) rotate(0deg);
-        opacity: 0;
-      }
-      50% {
-        opacity: 1;
-      }
-      100% {
-        transform: translateY(-100vh) rotate(360deg);
-        opacity: 0;
-      }
-    }
+    body { margin:0; background:#000; color:#0f0; font-family:monospace; display:flex; flex-direction:column; height:100vh; }
+    header { padding:1rem; background:#111; }
+    main { flex:1; display:flex; }
+    .sidebar { width:200px; background:#222; padding:1rem; }
+    .content { flex:1; position:relative; }
+    video { width:100%; height:100%; object-fit:cover; }
+    #localVideo { width:150px; height:150px; position:absolute; bottom:1rem; right:1rem; border:2px solid #0f0; }
+    button { margin:0.5rem 0; width:100%; padding:0.5rem; }
   </style>
 </head>
 <body>
-  <div class="background-effect" id="backgroundEffect"></div>
-  
-  <div class="container">
-    <div class="controls">
-      <div class="input-group">
-        <input id="roomInput" placeholder="Enter Party Room ID" />
-      </div>
-      <div class="button-group">
-        <button id="joinBtn">Join Party</button>
-        <button id="leaveBtn" disabled>Leave Party</button>
-      </div>
+  <header>
+    <input id="roomInput" placeholder="Room ID" />
+    <button id="joinBtn">Join Room</button>
+    <button id="leaveBtn" disabled>Leave Room</button>
+    <button id="shareScreenBtn" disabled>Share Screen</button>
+  </header>
+  <main>
+    <div class="sidebar">
+      <button id="toggleCamBtn" disabled>Toggle Camera</button>
     </div>
-
-    <div class="audio-visualizer">
-      <div class="wave-container">
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-      </div>
-      <div class="status-indicator" id="statusIndicator"></div>
+    <div class="content">
+      <video id="remoteVideo" autoplay playsinline></video>
+      <video id="localVideo" autoplay muted playsinline></video>
     </div>
-  </div>
-
+  </main>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script src="https://unpkg.com/simple-peer@9.11.1/simplepeer.min.js"></script>
   <script src="js/app.js"></script>
