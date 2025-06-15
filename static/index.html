@@ -24,6 +24,19 @@
       position: relative;
     }
 
+    .hide-ui-btn {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 20;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.7rem;
+}
+.hidden-ui {
+  display: none !important;
+}
+
+
     .container {
       width: 100%;
       height: 100%;
@@ -427,6 +440,8 @@
 </head>
 <body>
   <div class="container">
+    <button id="toggleUIBtn" class="pill-button hide-ui-btn">👁️</button>
+
     <!-- Background particles -->
     <div class="bg-particle" style="width: 6px; height: 6px; top: 20%; left: 10%; animation-delay: -2s;"></div>
     <div class="bg-particle" style="width: 4px; height: 4px; top: 60%; left: 80%; animation-delay: -4s;"></div>
@@ -452,6 +467,7 @@
     </div>
 
     <div class="control-buttons">
+      <button class="pill-button" id="toggleMicBtn" disabled>🎤 Mic</button>
       <button class="pill-button" id="toggleCamBtn" disabled>📹 Camera</button>
       <button class="pill-button" id="shareScreenBtn" disabled>🖥️ Share</button>
     </div>
