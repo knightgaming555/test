@@ -19,37 +19,55 @@ const socket = io();
     const audioVisualizer = document.getElementById('audioVisualizer');
     const statusIndicator = document.getElementById('statusIndicator');
 
-    // Initialize audio visualization
     function initAudioVisualization(stream) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      analyser = audioContext.createAnalyser();
-      const source = audioContext.createMediaStreamSource(stream);
-      
-      source.connect(analyser);
-      analyser.fftSize = 256;
-      
-      const bufferLength = analyser.frequencyBinCount;
-      dataArray = new Uint8Array(bufferLength);
-      
-      createWaves();
-      visualizeAudio();
+      try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioContext.createAnalyser();
+        const source = audioContext.createMediaStreamSource(stream);
+        
+        source.connect(analyser);
+        analyser.fftSize = 128;
+        
+        const bufferLength = analyser.frequencyBinCount;
+        dataArray = new Uint8Array(bufferLength);
+        
+        createWaves();
+        visualizeAudio();
+      } catch (error) {
+        console.error('Audio visualization failed:', error);
+        createStaticWaves();
+      }
     }
 
     function createWaves() {
       audioVisualizer.innerHTML = '';
-      const waveCount = 20;
+      const isMobile = window.innerWidth <= 768;
+      const waveCount = isMobile ? 12 : 16;
       
       for (let i = 0; i < waveCount; i++) {
         const wave = document.createElement('div');
         wave.className = 'wave';
-        wave.style.left = `${(i * 10) - 95}px`;
         wave.style.animationDelay = `${i * 0.1}s`;
         audioVisualizer.appendChild(wave);
       }
     }
 
+    function createStaticWaves() {
+      audioVisualizer.innerHTML = '';
+      const isMobile = window.innerWidth <= 768;
+      const waveCount = isMobile ? 12 : 16;
+      
+      for (let i = 0; i < waveCount; i++) {
+        const wave = document.createElement('div');
+        wave.className = 'wave';
+        wave.style.animationDelay = `${i * 0.1}s`;
+        wave.style.height = `${15 + Math.random() * 25}px`;
+        audioVisualizer.appendChild(wave);
+      }
+    }
+
     function visualizeAudio() {
-      if (!analyser) return;
+      if (!analyser || !dataArray) return;
       
       analyser.getByteFrequencyData(dataArray);
       
@@ -57,14 +75,15 @@ const socket = io();
       let maxAmplitude = 0;
       
       waves.forEach((wave, index) => {
-        const amplitude = dataArray[index * 4] || 0;
-        const height = Math.max(20, (amplitude / 255) * 100);
+        const amplitude = dataArray[index * 2] || 0;
+        const minHeight = window.innerWidth <= 768 ? 10 : 15;
+        const maxHeight = window.innerWidth <= 768 ? 25 : 40;
+        const height = Math.max(minHeight, (amplitude / 255) * maxHeight);
         wave.style.height = `${height}px`;
         maxAmplitude = Math.max(maxAmplitude, amplitude);
       });
       
-      // Add glow effect based on audio level
-      if (maxAmplitude > 50) {
+      if (maxAmplitude > 30) {
         centralCircle.classList.add('active');
       } else {
         centralCircle.classList.remove('active');
@@ -83,30 +102,37 @@ const socket = io();
         }
         return await navigator.mediaDevices.getUserMedia({ 
           audio: true, 
-          video 
+          video: video ? { 
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            facingMode: 'user'
+          } : false
         });
       } catch (e) {
-        alert('Media access denied.');
+        alert('Media access denied. Please allow camera and microphone access.');
         throw e;
       }
     }
 
     joinBtn.onclick = async () => {
       const room = roomInput.value.trim();
-      if (!room) return;
+      if (!room) {
+        alert('Please enter a room name');
+        return;
+      }
       
       try {
         localStream = await startMedia();
         localVideo.srcObject = localStream;
         localVideo.classList.add('visible');
         
-        // Initialize audio visualization
         initAudioVisualization(localStream);
         
         toggleCamBtn.disabled = false;
         shareScreenBtn.disabled = false;
         joinBtn.disabled = true;
         leaveBtn.disabled = false;
+        roomInput.disabled = true;
         
         statusIndicator.textContent = 'Connecting...';
         statusIndicator.className = 'status-indicator';
@@ -114,6 +140,8 @@ const socket = io();
         socket.emit('join_room', { room });
       } catch (error) {
         console.error('Failed to join room:', error);
+        statusIndicator.textContent = 'Connection failed';
+        statusIndicator.className = 'status-indicator disconnected';
       }
     };
 
@@ -129,7 +157,7 @@ const socket = io();
           toggleCamBtn.textContent = '📹 Camera';
         } else {
           localVideo.classList.remove('visible');
-          toggleCamBtn.textContent = '📹 Camera (Off)';
+          toggleCamBtn.textContent = '📹 Off';
         }
       }
     };
@@ -143,7 +171,6 @@ const socket = io();
           
           const screenTrack = screenStream.getVideoTracks()[0];
           
-          // Replace video track for all peers
           Object.values(peers).forEach(peer => {
             const sender = peer._pc.getSenders().find(s => 
               s.track && s.track.kind === 'video'
@@ -155,10 +182,9 @@ const socket = io();
           
           screenTrack.onended = () => {
             screenShare.classList.remove('visible');
-            shareScreenBtn.textContent = '🖥️ Share Screen';
+            shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Share' : '🖥️ Share Screen';
             isScreenSharing = false;
             
-            // Restore camera track
             const videoTrack = localStream.getVideoTracks()[0];
             Object.values(peers).forEach(peer => {
               const sender = peer._pc.getSenders().find(s => 
@@ -170,44 +196,40 @@ const socket = io();
             });
           };
           
-          shareScreenBtn.textContent = '🖥️ Stop Sharing';
+          shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Stop' : '🖥️ Stop Share';
           isScreenSharing = true;
         } else {
-          // Stop screen sharing
           const screenStream = screenShare.srcObject;
           if (screenStream) {
             screenStream.getTracks().forEach(track => track.stop());
           }
           screenShare.classList.remove('visible');
-          shareScreenBtn.textContent = '🖥️ Share Screen';
+          shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Share' : '🖥️ Share Screen';
           isScreenSharing = false;
         }
       } catch (error) {
         console.error('Screen sharing failed:', error);
+        alert('Screen sharing is not supported on this device');
       }
     };
 
     leaveBtn.onclick = () => {
       socket.emit('leave_room', { room: roomInput.value.trim() });
       
-      // Clean up peers
       Object.values(peers).forEach(p => p.destroy());
       peers = {};
       
-      // Stop all tracks
       if (localStream) {
         localStream.getTracks().forEach(t => t.stop());
       }
       
-      // Stop audio visualization
       if (animationId) {
         cancelAnimationFrame(animationId);
       }
-      if (audioContext) {
+      if (audioContext && audioContext.state !== 'closed') {
         audioContext.close();
       }
       
-      // Reset UI
       localVideo.srcObject = null;
       remoteVideo.srcObject = null;
       screenShare.srcObject = null;
@@ -221,19 +243,29 @@ const socket = io();
       shareScreenBtn.disabled = true;
       joinBtn.disabled = false;
       leaveBtn.disabled = true;
+      roomInput.disabled = false;
+      
+      toggleCamBtn.textContent = '📹 Camera';
+      shareScreenBtn.textContent = window.innerWidth <= 768 ? '🖥️ Share' : '🖥️ Share Screen';
       
       statusIndicator.textContent = 'Disconnected';
       statusIndicator.className = 'status-indicator disconnected';
       
-      // Clear audio visualizer
       audioVisualizer.innerHTML = '';
+      isScreenSharing = false;
     };
 
     socket.on('room_users', users => {
       users.filter(id => id !== socket.id).forEach(sid => {
         const peer = new SimplePeer({ 
           initiator: true, 
-          stream: localStream 
+          stream: localStream,
+          config: {
+            iceServers: [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:global.stun.twilio.com:3478' }
+            ]
+          }
         });
         setupPeer(peer, sid);
         peers[sid] = peer;
@@ -247,7 +279,13 @@ const socket = io();
       if (!peers[from]) {
         const peer = new SimplePeer({ 
           initiator: false, 
-          stream: localStream 
+          stream: localStream,
+          config: {
+            iceServers: [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:global.stun.twilio.com:3478' }
+            ]
+          }
         });
         setupPeer(peer, from);
         peers[from] = peer;
@@ -270,12 +308,37 @@ const socket = io();
       peer.on('close', () => {
         remoteVideo.classList.remove('visible');
         delete peers[sid];
+        
+        if (Object.keys(peers).length === 0) {
+          statusIndicator.textContent = 'Connected (No peers)';
+        }
+      });
+      
+      peer.on('error', (err) => {
+        console.error('Peer error:', err);
+        delete peers[sid];
       });
     }
 
-    // Enter key support for room input
     roomInput.addEventListener('keypress', (e) => {
       if (e.key === 'Enter' && !joinBtn.disabled) {
         joinBtn.click();
       }
     });
+
+    // Handle orientation changes
+    window.addEventListener('orientationchange', () => {
+      setTimeout(() => {
+        createWaves();
+      }, 100);
+    });
+
+    // Handle resize
+    window.addEventListener('resize', () => {
+      if (audioVisualizer.children.length > 0) {
+        createWaves();
+      }
+    });
+
+    // Initialize static waves on load
+    createStaticWaves();
