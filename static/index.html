@@ -1,36 +1,280 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Black Ops Chat & Share</title>
+  <title>Modern Video Chat</title>
   <style>
-    body { margin:0; background:#000; color:#0f0; font-family:monospace; display:flex; flex-direction:column; height:100vh; }
-    header { padding:1rem; background:#111; }
-    main { flex:1; display:flex; }
-    .sidebar { width:200px; background:#222; padding:1rem; }
-    .content { flex:1; position:relative; }
-    video { width:100%; height:100%; object-fit:cover; }
-    #localVideo { width:150px; height:150px; position:absolute; bottom:1rem; right:1rem; border:2px solid #0f0; }
-    button { margin:0.5rem 0; width:100%; padding:0.5rem; }
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #0a0a0a;
+      color: #ffffff;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+
+    .room-input-section {
+      position: absolute;
+      top: 3rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      z-index: 10;
+    }
+
+    .room-input {
+      background: rgba(255, 255, 255, 0.1);
+      border: 2px solid rgba(59, 130, 246, 0.3);
+      border-radius: 50px;
+      padding: 0.75rem 1.5rem;
+      color: white;
+      font-size: 1rem;
+      outline: none;
+      backdrop-filter: blur(10px);
+      transition: all 0.3s ease;
+      min-width: 200px;
+    }
+
+    .room-input:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+    }
+
+    .room-input::placeholder {
+      color: rgba(255, 255, 255, 0.6);
+    }
+
+    .pill-button {
+      background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+      border: none;
+      border-radius: 50px;
+      padding: 0.75rem 1.5rem;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      backdrop-filter: blur(10px);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .pill-button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 25px rgba(59, 130, 246, 0.4);
+    }
+
+    .pill-button:disabled {
+      background: rgba(255, 255, 255, 0.1);
+      color: rgba(255, 255, 255, 0.5);
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .pill-button.leave {
+      background: linear-gradient(135deg, #ef4444, #dc2626);
+    }
+
+    .pill-button.leave:hover {
+      box-shadow: 0 10px 25px rgba(239, 68, 68, 0.4);
+    }
+
+    .central-circle {
+      width: 300px;
+      height: 300px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(59, 130, 246, 0.1), rgba(59, 130, 246, 0.05));
+      border: 3px solid rgba(59, 130, 246, 0.4);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      box-shadow: 
+        0 0 50px rgba(59, 130, 246, 0.3),
+        inset 0 0 50px rgba(59, 130, 246, 0.1);
+      transition: all 0.3s ease;
+    }
+
+    .audio-visualizer {
+      width: 200px;
+      height: 200px;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .wave {
+      position: absolute;
+      width: 4px;
+      background: linear-gradient(to top, #3b82f6, #60a5fa);
+      border-radius: 2px;
+      animation: wave 1s ease-in-out infinite alternate;
+      opacity: 0.8;
+    }
+
+    @keyframes wave {
+      0% { height: 20px; }
+      100% { height: 60px; }
+    }
+
+    .control-buttons {
+      position: absolute;
+      bottom: 3rem;
+      display: flex;
+      gap: 1rem;
+      z-index: 10;
+    }
+
+    .local-video {
+      position: absolute;
+      bottom: 2rem;
+      right: 2rem;
+      width: 200px;
+      height: 150px;
+      border-radius: 15px;
+      border: 3px solid rgba(59, 130, 246, 0.6);
+      object-fit: cover;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      transform: scale(0);
+      transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+      z-index: 10;
+    }
+
+    .local-video.visible {
+      transform: scale(1);
+    }
+
+    .remote-video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      z-index: 1;
+      opacity: 0;
+      transition: opacity 0.5s ease;
+    }
+
+    .remote-video.visible {
+      opacity: 1;
+    }
+
+    .screen-share {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+      z-index: 5;
+      opacity: 0;
+      transition: opacity 0.5s ease;
+    }
+
+    .screen-share.visible {
+      opacity: 1;
+    }
+
+    .status-indicator {
+      position: absolute;
+      top: 1rem;
+      right: 1rem;
+      padding: 0.5rem 1rem;
+      background: rgba(0, 0, 0, 0.7);
+      border-radius: 20px;
+      font-size: 0.9rem;
+      backdrop-filter: blur(10px);
+      z-index: 10;
+    }
+
+    .connected {
+      color: #10b981;
+    }
+
+    .disconnected {
+      color: #ef4444;
+    }
+
+    /* Pulsing glow effect for active audio */
+    .central-circle.active {
+      box-shadow: 
+        0 0 100px rgba(59, 130, 246, 0.6),
+        inset 0 0 50px rgba(59, 130, 246, 0.2);
+      border-color: rgba(59, 130, 246, 0.8);
+    }
+
+    /* Background particles */
+    .bg-particle {
+      position: absolute;
+      background: rgba(59, 130, 246, 0.1);
+      border-radius: 50%;
+      pointer-events: none;
+      animation: float 6s ease-in-out infinite;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0px) rotate(0deg); }
+      50% { transform: translateY(-20px) rotate(180deg); }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <input id="roomInput" placeholder="Room ID" />
-    <button id="joinBtn">Join Room</button>
-    <button id="leaveBtn" disabled>Leave Room</button>
-    <button id="shareScreenBtn" disabled>Share Screen</button>
-  </header>
-  <main>
-    <div class="sidebar">
-      <button id="toggleCamBtn" disabled>Toggle Camera</button>
+  <div class="container">
+    <!-- Background particles -->
+    <div class="bg-particle" style="width: 8px; height: 8px; top: 20%; left: 10%; animation-delay: -2s;"></div>
+    <div class="bg-particle" style="width: 6px; height: 6px; top: 60%; left: 80%; animation-delay: -4s;"></div>
+    <div class="bg-particle" style="width: 10px; height: 10px; top: 80%; left: 20%; animation-delay: -1s;"></div>
+    <div class="bg-particle" style="width: 4px; height: 4px; top: 30%; right: 15%; animation-delay: -3s;"></div>
+
+    <div class="status-indicator disconnected" id="statusIndicator">
+      Disconnected
     </div>
-    <div class="content">
-      <video id="remoteVideo" autoplay playsinline></video>
-      <video id="localVideo" autoplay muted playsinline></video>
+
+    <div class="room-input-section">
+      <input type="text" class="room-input" id="roomInput" placeholder="Enter room name">
+      <button class="pill-button" id="joinBtn">Join</button>
+      <button class="pill-button leave" id="leaveBtn" disabled>Leave</button>
     </div>
-  </main>
+
+    <div class="central-circle" id="centralCircle">
+      <div class="audio-visualizer" id="audioVisualizer">
+        <!-- Audio waves will be generated here -->
+      </div>
+    </div>
+
+    <div class="control-buttons">
+      <button class="pill-button" id="toggleCamBtn" disabled>📹 Camera</button>
+      <button class="pill-button" id="shareScreenBtn" disabled>🖥️ Share Screen</button>
+    </div>
+
+    <video class="remote-video" id="remoteVideo" autoplay playsinline></video>
+    <video class="screen-share" id="screenShare" autoplay playsinline></video>
+    <video class="local-video" id="localVideo" autoplay muted playsinline></video>
+  </div>
+
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script src="https://unpkg.com/simple-peer@9.11.1/simplepeer.min.js"></script>
   <script src="js/app.js"></script>
