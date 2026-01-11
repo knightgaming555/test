@@ -1,6 +1,6 @@
 // public/client.js
-// Two-way screen share with robust canvas-fullscreen fallback
-// + Fix: Late joiners immediately receive existing streams
+// Fix: Local video uses standard fullscreen to avoid feedback loops/green artifacts
+// Remote videos use Canvas fallback to fix decoding glitches
 
 const socket = io();
 const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
@@ -40,12 +40,23 @@ copyUrlBtn.onclick = async () => {
   catch { appendLog(localInfo, 'Copy failed'); }
 };
 
-localFullBtn.onclick = () => canvasFullscreenFallback(localVideo);
+// --- FIX 1: Local Video uses Standard Fullscreen (Lightweight) ---
+localFullBtn.onclick = () => requestStandardFullscreen(localVideo);
+localVideo.addEventListener('dblclick', () => requestStandardFullscreen(localVideo));
+
+function requestStandardFullscreen(elem) {
+  try {
+    if (elem.requestFullscreen) elem.requestFullscreen();
+    else if (elem.webkitRequestFullscreen) elem.webkitRequestFullscreen();
+    else if (elem.msRequestFullscreen) elem.msRequestFullscreen();
+  } catch (e) {
+    console.warn("Fullscreen failed", e);
+  }
+}
 
 function appendLog(el, txt){ el.textContent = txt; }
 
-// ---------------- Robust canvas fullscreen implementation ----------------
-// Map videoEl -> state { canvas, ctx, rafId, rvfcId, offscreen, stopFn }
+// ---------------- Robust canvas fullscreen (For Remote Streams Only) ----------------
 const canvasState = new Map();
 
 function makeCanvas(videoEl) {
@@ -199,13 +210,11 @@ async function canvasFullscreenFallback(videoEl) {
 }
 // -------------------------------------------------------------------------
 
-// Helper to add tracks
 function addLocalTracksToPc(pc, stream) {
   const senders = pc.getSenders();
   const videoTrack = stream.getVideoTracks()[0];
   let replaced = false;
 
-  // Try to replace existing sender first (cleaner renegotiation)
   if (senders.length) {
     for (const s of senders) {
       if (s.track && s.track.kind === 'video') {
@@ -236,10 +245,7 @@ function ensurePeerConnection(){
   pc.ontrack = (e) => {
     const stream = e.streams[0] || new MediaStream([e.track]);
     const id = stream.id; 
-    // Sometimes stream ID is same, check if element exists
     let videoEl = document.getElementById('remote-' + id);
-    
-    // Fallback ID if stream.id is unstable
     const domId = 'remote-' + (videoEl ? id : Math.random().toString(36).substr(2,9));
     
     if (!videoEl) {
@@ -254,6 +260,7 @@ function ensurePeerConnection(){
       videoEl.controls = false;
       videoEl.style.width = '100%';
       videoEl.style.background = '#000';
+      // Remotes still use the robust canvas fullscreen fallback
       videoEl.addEventListener('dblclick', () => canvasFullscreenFallback(videoEl));
 
       const btn = document.createElement('button');
@@ -323,34 +330,23 @@ function stopSharing() {
     localStream = null;
     localVideo.srcObject = null;
   }
-  if (canvasState.has(localVideo)) canvasState.get(localVideo).stopFn();
+  // No complex cleanup needed for local video now
   shareBtn.disabled = false;
   stopBtn.disabled = true;
-  // Note: we keep the connection open, just stop sending tracks if desired, 
-  // but for simplicity we assume stopping share doesn't kill the socket connection.
 }
 
 socket.on('connect', () => appendLog(localInfo, 'Connected'));
 
-// --- FIX: Late Joiner Logic ---
 socket.on('peer-joined', async () => {
   appendLog(localInfo, `Peer joined.`);
-  
-  // If I am currently sharing, I must initiate a new offer 
-  // so the new peer receives the stream.
   if (localStream && pc) {
     appendLog(localInfo, 'Syncing stream to new peer...');
     try {
-      // Re-ensure tracks are attached (in case of connection hiccups)
       addLocalTracksToPc(pc, localStream);
-
-      // Create a fresh offer (renegotiation)
       const offer = await pc.createOffer({ offerToReceiveVideo: true });
       await pc.setLocalDescription(offer);
       socket.emit('offer', { room, desc: pc.localDescription });
-    } catch (e) {
-      console.error('Error syncing to new peer', e);
-    }
+    } catch (e) { console.error('Error syncing to new peer', e); }
   }
 });
 
@@ -373,8 +369,5 @@ socket.on('ice-candidate', async ({ candidate }) => {
   try { await ensurePeerConnection().addIceCandidate(candidate); } catch (e) {}
 });
 
-// hydrate room from URL
 const p = new URLSearchParams(location.search);
 if (p.get('room')) roomInput.value = p.get('room');
-
-localVideo.addEventListener('dblclick', () => canvasFullscreenFallback(localVideo));
