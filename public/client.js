@@ -1,9 +1,7 @@
-// client.js - two-way screen share with quality knobs and fullscreen
+// client.js - two-way screen share with fullscreen fix + quality knobs
 const socket = io();
 
-const pcConfig = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-};
+const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 let pc = null;
 let localStream = null;
@@ -39,19 +37,48 @@ copyUrlBtn.onclick = async () => {
   catch { appendLog(localInfo, 'Copy failed'); }
 };
 
-localFullBtn.onclick = () => requestFullscreen(localVideo);
+localFullBtn.onclick = () => enterFullscreen(localVideo);
 
-function appendLog(el, txt){
-  el.textContent = txt;
-}
+function appendLog(el, txt){ el.textContent = txt; }
 
-// utility: request fullscreen for element
-async function requestFullscreen(el){
+// ---------- Fullscreen helpers (fixes black screen) ----------
+async function enterFullscreen(el){
   if (!el) return;
-  if (el.requestFullscreen) return el.requestFullscreen();
-  if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
-  if (el.msRequestFullscreen) return el.msRequestFullscreen();
+  // request fullscreen on the video element (not wrapper)
+  try {
+    if (el.requestFullscreen) await el.requestFullscreen();
+    else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
+    else if (el.msRequestFullscreen) await el.msRequestFullscreen();
+  } catch (err) {
+    console.warn('Fullscreen request failed', err);
+  }
+  // ensure playback restarts and force a repaint
+  try { await el.play(); } catch (e) { /* ignore */ }
+  forceRepaint(el);
 }
+
+function forceRepaint(el){
+  // a tiny GPU hint and repaint hack that's effective in most browsers
+  el.style.transform = 'translateZ(0)';
+  // small timeout to clear the hack
+  setTimeout(() => { el.style.transform = ''; }, 120);
+}
+
+// handle fullscreen change to re-play & repaint remote video(s)
+function onFullScreenChange(){
+  const fs = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
+  if (fs && fs.tagName === 'VIDEO') {
+    try { fs.play(); } catch (e) {}
+    forceRepaint(fs);
+  } else {
+    // when exiting fullscreen, try to play local video again
+    try { localVideo.play(); } catch (e) {}
+  }
+}
+document.addEventListener('fullscreenchange', onFullScreenChange);
+document.addEventListener('webkitfullscreenchange', onFullScreenChange);
+document.addEventListener('msfullscreenchange', onFullScreenChange);
+// ---------------------------------------------------------------
 
 // create or reuse RTCPeerConnection
 function ensurePeerConnection(){
@@ -66,12 +93,13 @@ function ensurePeerConnection(){
     const streams = e.streams;
     if (!streams || streams.length === 0) return;
     const stream = streams[0];
-    // identify stream by remote id in track's id + stream id, but we'll use track.id + stream.id
-    const id = stream.id || e.track.id;
-    const from = e.track?.id || id;
-    // check if video element exists for this stream
+    // try to find an existing element by stream id
+    const id = stream.id || (e.track && e.track.id) || Math.random().toString(36).slice(2,9);
+    let wrapper = document.getElementById('wrapper-' + id);
     let videoEl = document.getElementById('remote-' + id);
+
     if (!videoEl) {
+      // create elements
       videoEl = document.createElement('video');
       videoEl.id = 'remote-' + id;
       videoEl.autoplay = true;
@@ -79,25 +107,44 @@ function ensurePeerConnection(){
       videoEl.controls = false;
       videoEl.style.display = 'block';
       videoEl.style.width = '100%';
-      videoEl.style.maxHeight = '60vh';
-      videoEl.addEventListener('dblclick', () => requestFullscreen(videoEl));
-      // add a small badge
-      const wrapper = document.createElement('div');
+      videoEl.style.height = 'auto';
+      videoEl.style.maxHeight = '80vh';
+      videoEl.style.background = '#000';
+      videoEl.addEventListener('dblclick', () => enterFullscreen(videoEl));
+
+      wrapper = document.createElement('div');
+      wrapper.id = 'wrapper-' + id;
       wrapper.className = 'video-card';
       const badge = document.createElement('div');
       badge.className = 'badge';
       badge.textContent = 'Remote';
       wrapper.appendChild(badge);
       wrapper.appendChild(videoEl);
-      remotesContainer.appendChild(wrapper);
 
-      // add fullscreen button
+      // fullscreen button (keeps focus on video element)
       const btn = document.createElement('button');
       btn.textContent = 'Fullscreen';
-      btn.onclick = () => requestFullscreen(videoEl);
+      btn.style.marginTop = '8px';
+      btn.onclick = () => enterFullscreen(videoEl);
       wrapper.appendChild(btn);
+
+      remotesContainer.appendChild(wrapper);
     }
-    videoEl.srcObject = stream;
+
+    // attach stream then play
+    if (videoEl.srcObject !== stream) {
+      try {
+        videoEl.srcObject = stream;
+        // small delay then play to avoid black frame issues in some browsers
+        setTimeout(() => {
+          videoEl.play().catch(()=>{});
+          forceRepaint(videoEl);
+        }, 50);
+      } catch (err) {
+        console.warn('Failed to set srcObject or play', err);
+      }
+    }
+
     appendLog(remoteInfo, 'Remote streams: ' + remotesContainer.querySelectorAll('video').length);
   };
 
@@ -115,15 +162,12 @@ async function trySetMaxBitrate(sender, kbps) {
     const params = sender.getParameters();
     if (!params.encodings) params.encodings = [{}];
     params.encodings.forEach(e => {
-      // set max bitrate
       e.maxBitrate = kbps * 1000;
-      // prefer performance
       e.priority = 'high';
     });
     await sender.setParameters(params);
-    console.log('set sender params', params);
   } catch (e) {
-    console.warn('Failed to set sender parameters', e);
+    // browsers may refuse, ignore
   }
 }
 
@@ -137,50 +181,42 @@ shareBtn.onclick = async () => {
   else constraints = { video: { width: { ideal: 854 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }, audio: false };
 
   try {
-    // ask user to share screen
     localStream = await navigator.mediaDevices.getDisplayMedia(constraints);
   } catch (err) {
     return alert('Failed to get display media: ' + (err.message || err));
   }
 
   localVideo.srcObject = localStream;
+  try { await localVideo.play(); } catch (e) {}
   shareBtn.disabled = true;
   stopBtn.disabled = false;
 
   ensurePeerConnection();
 
-  // add tracks (use replaceTrack if we've already shared once)
   const senders = pc.getSenders ? pc.getSenders() : [];
   const videoTrack = localStream.getVideoTracks()[0];
 
-  // try to reuse existing video sender by replacing track
   let replaced = false;
   if (senders && senders.length) {
     for (const s of senders) {
       if (s.track && s.track.kind === 'video') {
         try {
           await s.replaceTrack(videoTrack);
-          // set bitrate target to 8 Mbps (8000 kbps) for high quality if supported
           await trySetMaxBitrate(s, 8000);
           replaced = true;
           break;
-        } catch (e) {
-          // ignore and continue
-        }
+        } catch (e) {}
       }
     }
   }
 
   if (!replaced) {
-    // add new track(s)
     localStream.getTracks().forEach(track => {
       const sender = pc.addTrack(track, localStream);
-      // try to increase bitrate on that sender
       trySetMaxBitrate(sender, 8000);
     });
   }
 
-  // create an offer to notify the other peer(s)
   try {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -190,7 +226,8 @@ shareBtn.onclick = async () => {
   }
 
   // stop sharing when user stops in browser
-  videoTrack.addEventListener('ended', () => stopSharing());
+  const vt = localStream.getVideoTracks()[0];
+  if (vt) vt.addEventListener('ended', () => stopSharing());
 };
 
 // stop sharing local screen
@@ -210,18 +247,14 @@ socket.on('connect', () => {
   appendLog(localInfo, 'Connected: ' + clientId);
 });
 
-// when someone else joins
-socket.on('peer-joined', (peerId) => {
+socket.on('peer-joined', () => {
   appendLog(localInfo, `Peer joined`);
 });
 
-// incoming offer
 socket.on('offer', async ({ from, desc }) => {
-  console.log('got offer', from);
   ensurePeerConnection();
   try {
     await pc.setRemoteDescription(desc);
-    // create answer
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     socket.emit('answer', { room, desc: pc.localDescription });
@@ -230,21 +263,15 @@ socket.on('offer', async ({ from, desc }) => {
   }
 });
 
-// incoming answer
 socket.on('answer', async ({ from, desc }) => {
-  console.log('got answer', from);
   try {
-    if (!pc) {
-      console.warn('No pc when answer arrived');
-      return;
-    }
+    if (!pc) return;
     await pc.setRemoteDescription(desc);
   } catch (e) {
     console.error('Error setting remote desc', e);
   }
 });
 
-// incoming ice
 socket.on('ice-candidate', async ({ from, candidate }) => {
   if (!candidate) return;
   try {
@@ -257,7 +284,7 @@ socket.on('ice-candidate', async ({ from, candidate }) => {
 // stop button
 stopBtn.onclick = () => stopSharing();
 
-// parse room from URL if provided
+// hydrate room from URL if provided
 (function hydrateFromUrl(){
   const p = new URLSearchParams(location.search);
   const r = p.get('room');
@@ -265,4 +292,4 @@ stopBtn.onclick = () => stopSharing();
 })();
 
 // double-click local video to fullscreen
-localVideo.addEventListener('dblclick', () => requestFullscreen(localVideo));
+localVideo.addEventListener('dblclick', () => enterFullscreen(localVideo));
