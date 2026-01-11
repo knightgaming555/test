@@ -14,35 +14,64 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install dependencies
+      - name: Install deps
         run: npm install
 
       - name: Start server
         run: |
           nohup node server.js > server.log 2>&1 &
           sleep 2
-          echo "Server started on port 3000"
+          echo "Server started (if no errors)."
 
-      - name: Start ngrok
+      - name: Install jq (for JSON parsing)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Start ngrok and get public URL
         id: start_ngrok
         env:
           NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
         run: |
+          # start ngrok in background
           npx ngrok@4 http 3000 --authtoken="$NGROK_TOKEN" --log=stdout > ngrok.log 2>&1 &
-          echo "Starting ngrok..."
-          # Wait for ngrok to start
-          for i in $(seq 1 15); do
+          echo "ngrok started, waiting for API..."
+
+          # wait and poll the local ngrok API for up to 30 seconds
+          URL=""
+          for i in $(seq 1 30); do
             sleep 1
-            if curl -s http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
-              break
+            DATA=$(curl -s http://127.0.0.1:4040/api/tunnels || true)
+            # ensure DATA is valid json and contains a tunnel
+            if [ -n "$DATA" ] && echo "$DATA" | jq -e . >/dev/null 2>&1; then
+              URL=$(echo "$DATA" | jq -r '.tunnels[0].public_url // empty')
+              if [ -n "$URL" ]; then
+                break
+              fi
             fi
           done
-          URL=$(curl -s http://127.0.0.1:4040/api/tunnels | python3 -c "import sys,json; j=json.load(sys.stdin); print(j['tunnels'][0]['public_url'] if j.get('tunnels') else '')")
+
+          # fallback: try to extract URL directly from ngrok.log
+          if [ -z "$URL" ]; then
+            echo "API returned empty or invalid JSON; trying ngrok.log fallback..."
+            URL=$(grep -oE 'https?://[a-z0-9.-]+\.ngrok.io' ngrok.log | head -n1 || true)
+          fi
+
+          # final check: print helpful debug info if missing
+          if [ -z "$URL" ]; then
+            echo "Failed to get ngrok URL."
+            echo "---- ngrok.log (last 200 lines) ----"
+            tail -n 200 ngrok.log || true
+            echo "---- server.log (last 200 lines) ----"
+            tail -n 200 server.log || true
+            exit 1
+          fi
+
           echo "ngrok_url=$URL" >> $GITHUB_OUTPUT
           echo "Public ngrok URL: $URL"
 
       - name: Print access info
         run: |
-          echo "Access with:"
+          echo "Public URL: ${{ steps.start_ngrok.outputs.ngrok_url }}"
           echo "Username: ${{ secrets.NGROK_APP_USERNAME }}"
           echo "Password: ${{ secrets.NGROK_APP_PASSWORD }}"
