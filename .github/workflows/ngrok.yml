@@ -21,12 +21,22 @@ jobs:
         run: |
           nohup node server.js > server.log 2>&1 &
           sleep 2
-          echo "Server started (if no errors)."
+          echo "Server started on port 3000 (if no errors in server.log)."
 
-      - name: Install jq (for JSON parsing)
+      - name: Install utilities
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq
+          sudo apt-get install -y jq wget tar
+
+      - name: Download & install ngrok v3
+        run: |
+          echo "Downloading official ngrok v3 binary..."
+          # x86_64 binary. If you need arm64, change filename to ngrok-v3-stable-linux-arm64.tgz
+          wget -q -O ngrok-v3.tgz "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz"
+          sudo tar -xzf ngrok-v3.tgz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/ngrok
+          /usr/local/bin/ngrok version || true
+          echo "ngrok v3 installed."
 
       - name: Start ngrok and get public URL
         id: start_ngrok
@@ -34,7 +44,7 @@ jobs:
           NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
         run: |
           # start ngrok in background
-          npx ngrok@4 http 3000 --authtoken="$NGROK_TOKEN" --log=stdout > ngrok.log 2>&1 &
+          /usr/local/bin/ngrok http 3000 --authtoken="$NGROK_TOKEN" --log=stdout > ngrok.log 2>&1 &
           echo "ngrok started, waiting for API..."
 
           # wait and poll the local ngrok API for up to 30 seconds
@@ -42,7 +52,6 @@ jobs:
           for i in $(seq 1 30); do
             sleep 1
             DATA=$(curl -s http://127.0.0.1:4040/api/tunnels || true)
-            # ensure DATA is valid json and contains a tunnel
             if [ -n "$DATA" ] && echo "$DATA" | jq -e . >/dev/null 2>&1; then
               URL=$(echo "$DATA" | jq -r '.tunnels[0].public_url // empty')
               if [ -n "$URL" ]; then
@@ -57,7 +66,6 @@ jobs:
             URL=$(grep -oE 'https?://[a-z0-9.-]+\.ngrok.io' ngrok.log | head -n1 || true)
           fi
 
-          # final check: print helpful debug info if missing
           if [ -z "$URL" ]; then
             echo "Failed to get ngrok URL."
             echo "---- ngrok.log (last 200 lines) ----"
