@@ -2,32 +2,71 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Screen share - simple</title>
+  <title>Screen share — two-way, high quality</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; max-width: 900px; margin: auto; }
-    video { width: 100%; max-height: 60vh; background: #000; }
-    .controls { margin-top: 10px; display:flex; gap:8px; flex-wrap:wrap; }
-    input, button { padding:8px; font-size: 14px; }
+    body { font-family: system-ui, sans-serif; padding: 16px; max-width: 1100px; margin: auto; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .col { flex: 1 1 480px; min-width: 320px; }
+    .video-card { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
+    video { width: 100%; height: auto; display:block; background: #000; }
+    .controls { margin: 10px 0; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    input, button, select { padding:8px; font-size:14px; }
+    .badge { position: absolute; right: 8px; top: 8px; background: rgba(0,0,0,0.6); color:#fff; padding:6px 8px; border-radius:6px; font-size:13px;}
+    .video-toolbar { display:flex; gap:8px; padding:8px; align-items:center; justify-content:space-between; background:#fafafa; border-radius:8px; margin-top:8px; }
   </style>
 </head>
 <body>
-  <h1>Screen share (simple)</h1>
-  <p>Open this URL on another device, enter the same room ID, then click "Share screen" on one side.</p>
+  <h1>Screen share — two-way</h1>
+  <p>Open the same room on two devices. Both can click "Share screen" to send their screen. Click fullscreen to view any stream full screen.</p>
 
   <label>
     Room ID:
-    <input id="room" placeholder="room-name" />
+    <input id="room" placeholder="room-name" value="room1" />
   </label>
 
   <div class="controls">
     <button id="join">Join Room</button>
     <button id="share" disabled>Share screen</button>
     <button id="stop" disabled>Stop sharing</button>
+
+    <label style="display:flex;align-items:center;gap:8px;">
+      Quality:
+      <select id="quality">
+        <option value="high" selected>High (1080p / 60fps)</option>
+        <option value="medium">Medium (720p / 30fps)</option>
+        <option value="low">Low (480p / 24fps)</option>
+      </select>
+    </label>
   </div>
 
-  <h3>Remote stream</h3>
-  <video id="remoteVideo" autoplay playsinline></video>
+  <div class="row">
+    <div class="col">
+      <div class="video-card">
+        <div class="badge">You (local)</div>
+        <video id="localVideo" autoplay playsinline muted></video>
+      </div>
+      <div class="video-toolbar">
+        <div>
+          <button id="local-full">Fullscreen local</button>
+          <button id="copy-url">Copy room link</button>
+        </div>
+        <div id="local-info"></div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="video-card" id="remotes">
+        <!-- remote videos inserted here -->
+      </div>
+      <div class="video-toolbar">
+        <div>
+          <span>Remote streams</span>
+        </div>
+        <div id="remote-info"></div>
+      </div>
+    </div>
+  </div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script src="/client.js"></script>
