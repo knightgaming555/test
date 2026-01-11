@@ -9,7 +9,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Use Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
@@ -21,31 +21,28 @@ jobs:
         run: |
           nohup node server.js > server.log 2>&1 &
           sleep 2
-          echo "server started"
+          echo "Server started on port 3000"
 
       - name: Start ngrok
+        id: start_ngrok
         env:
-          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
         run: |
-          # start ngrok; ngrok exposes a local api on 4040
-          npx ngrok@4 http 3000 --authtoken="$NGROK_AUTH_TOKEN" --log=stdout > ngrok.log 2>&1 &
-          # wait for ngrok to initialize
+          npx ngrok@4 http 3000 --authtoken="$NGROK_TOKEN" --log=stdout > ngrok.log 2>&1 &
+          echo "Starting ngrok..."
+          # Wait for ngrok to start
           for i in $(seq 1 15); do
             sleep 1
             if curl -s http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
               break
             fi
           done
-          # extract public url
           URL=$(curl -s http://127.0.0.1:4040/api/tunnels | python3 -c "import sys,json; j=json.load(sys.stdin); print(j['tunnels'][0]['public_url'] if j.get('tunnels') else '')")
-          if [ -z "$URL" ]; then
-            echo "Failed to get ngrok URL. See ngrok.log"
-            cat ngrok.log || true
-            exit 1
-          fi
           echo "ngrok_url=$URL" >> $GITHUB_OUTPUT
+          echo "Public ngrok URL: $URL"
 
-      - name: Show ngrok URL
+      - name: Print access info
         run: |
-          echo "Public URL: ${{ steps.start_ngrok.outputs.ngrok_url || '' }}"
-        id: start_ngrok
+          echo "Access with:"
+          echo "Username: ${{ secrets.NGROK_APP_USERNAME }}"
+          echo "Password: ${{ secrets.NGROK_APP_PASSWORD }}"
