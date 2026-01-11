@@ -1,9 +1,6 @@
 // public/client.js
 // Two-way screen share with robust canvas-fullscreen fallback
-// - uses requestVideoFrameCallback + createImageBitmap when possible
-// - falls back to RAF + createImageBitmap
-// - uses OffscreenCanvas when available
-// - includes cleanup and retries
+// + Fix: Late joiners immediately receive existing streams
 
 const socket = io();
 const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
@@ -12,7 +9,7 @@ let pc = null;
 let localStream = null;
 let room = null;
 
-// UI
+// UI Elements
 const localVideo = document.getElementById('localVideo');
 const remotesContainer = document.getElementById('remotes');
 const roomInput = document.getElementById('room');
@@ -25,6 +22,7 @@ const copyUrlBtn = document.getElementById('copy-url');
 const localInfo = document.getElementById('local-info');
 const remoteInfo = document.getElementById('remote-info');
 
+// Join Room
 joinBtn.onclick = () => {
   room = roomInput.value.trim();
   if (!room) return alert('Enter a room ID.');
@@ -35,6 +33,7 @@ joinBtn.onclick = () => {
   appendLog(localInfo, `Joined ${room}`);
 };
 
+// Copy URL
 copyUrlBtn.onclick = async () => {
   const url = `${location.origin}${location.pathname}?room=${encodeURIComponent(room)}`;
   try { await navigator.clipboard.writeText(url); appendLog(localInfo, 'Room link copied'); }
@@ -50,7 +49,6 @@ function appendLog(el, txt){ el.textContent = txt; }
 const canvasState = new Map();
 
 function makeCanvas(videoEl) {
-  // Use OffscreenCanvas when available for performance
   const useOffscreen = typeof OffscreenCanvas !== 'undefined';
   const w = videoEl.videoWidth || 1280;
   const h = videoEl.videoHeight || 720;
@@ -60,60 +58,35 @@ function makeCanvas(videoEl) {
       const off = new OffscreenCanvas(w, h);
       const ctx = off.getContext('2d', { willReadFrequently: true, alpha: false });
       return { canvas: off, ctx, isOffscreen: true, w, h };
-    } catch (e) {
-      // fallback to DOM canvas
-    }
+    } catch (e) {}
   }
 
   const c = document.createElement('canvas');
-  c.width = w;
-  c.height = h;
-  c.style.width = '100%';
-  c.style.height = '100%';
-  c.style.display = 'block';
-  c.style.background = '#000';
+  c.width = w; c.height = h;
   const ctx = c.getContext('2d', { willReadFrequently: true, alpha: false });
   ctx.imageSmoothingEnabled = true;
   return { canvas: c, ctx, isOffscreen: false, w, h };
 }
 
-// Draw using requestVideoFrameCallback + createImageBitmap (best)
 function startRvfcDraw(videoEl, state) {
   let running = true;
-
-  // wrapper to schedule next frame
   const loop = (now, meta) => {
     if (!running) return;
-    // createImageBitmap is used to ensure we get a decoded frame and correct color space
     createImageBitmap(videoEl).then(bitmap => {
       try {
-        // If OffscreenCanvas, draw directly. If DOM canvas, use its ctx.
-        const ctx = state.ctx;
         if (state.canvas.width !== bitmap.width || state.canvas.height !== bitmap.height) {
           state.canvas.width = bitmap.width;
           state.canvas.height = bitmap.height;
         }
-        ctx.drawImage(bitmap, 0, 0, state.canvas.width, state.canvas.height);
+        state.ctx.drawImage(bitmap, 0, 0, state.canvas.width, state.canvas.height);
         bitmap.close?.();
-      } catch (e) {
-        // ignore intermittent errors
-        console.warn('draw error', e);
-      } finally {
-        // schedule next via rvfc if still running
-        if (running && videoEl.requestVideoFrameCallback) {
-          state.rvfcId = videoEl.requestVideoFrameCallback(loop);
-        } else {
-          // fallback to RAF loop
-          state.rafId = requestAnimationFrame(rafLoop);
-        }
+      } catch (e) { console.warn('draw error', e); }
+      finally {
+        if (running && videoEl.requestVideoFrameCallback) state.rvfcId = videoEl.requestVideoFrameCallback(loop);
+        else state.rafId = requestAnimationFrame(rafLoop);
       }
-    }).catch(err=>{
-      // if createImageBitmap fails, fallback quickly to RAF
-      if (running) state.rafId = requestAnimationFrame(rafLoop);
-    });
+    }).catch(() => { if (running) state.rafId = requestAnimationFrame(rafLoop); });
   };
-
-  // RAF fallback drawing step
   const rafLoop = () => {
     if (!running) return;
     try {
@@ -122,189 +95,136 @@ function startRvfcDraw(videoEl, state) {
         state.canvas.height = videoEl.videoHeight || state.canvas.height;
       }
       state.ctx.drawImage(videoEl, 0, 0, state.canvas.width, state.canvas.height);
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
     state.rafId = requestAnimationFrame(rafLoop);
   };
 
-  // start with rvfc if available
-  if (videoEl.requestVideoFrameCallback) {
-    try {
-      state.rvfcId = videoEl.requestVideoFrameCallback(loop);
-    } catch (e) {
-      state.rafId = requestAnimationFrame(rafLoop);
-    }
-  } else {
-    state.rafId = requestAnimationFrame(rafLoop);
-  }
+  if (videoEl.requestVideoFrameCallback) state.rvfcId = videoEl.requestVideoFrameCallback(loop);
+  else state.rafId = requestAnimationFrame(rafLoop);
 
   return () => {
     running = false;
-    if (state.rvfcId && videoEl.cancelVideoFrameCallback) {
-      try { videoEl.cancelVideoFrameCallback(state.rvfcId); } catch {}
-    }
-    if (state.rafId) {
-      try { cancelAnimationFrame(state.rafId); } catch {}
-    }
-    state.rvfcId = null;
-    state.rafId = null;
+    if (state.rvfcId && videoEl.cancelVideoFrameCallback) videoEl.cancelVideoFrameCallback(state.rvfcId);
+    if (state.rafId) cancelAnimationFrame(state.rafId);
   };
 }
 
 async function canvasFullscreenFallback(videoEl) {
-  if (!videoEl) return;
-  // if already active for this video, ignore
-  if (canvasState.has(videoEl)) return;
+  if (!videoEl || canvasState.has(videoEl)) return;
+  try { await videoEl.play(); } catch (e) {}
 
-  // make sure video is playing (some browsers need play before frames are available)
-  try { await videoEl.play(); } catch (e) { /* ignore */ }
-
-  // create canvas (Offscreen or DOM) and start draw loop
   const { canvas, ctx, isOffscreen } = makeCanvas(videoEl);
-  const domCanvas = isOffscreen ? (function(){ // convert Offscreen to DOM for fullscreen: transfer to ImageBitmap on RAF
-    const placeholder = document.createElement('canvas');
-    placeholder.style.width = '100%';
-    placeholder.style.height = '100%';
-    placeholder.style.display = 'block';
-    placeholder.style.background = '#000';
-    // we'll draw frames into offscreen and then copy to placeholder using transferToImageBitmap
-    return { placeholder, isProxy: true };
+  const domCanvas = isOffscreen ? (() => {
+    const p = document.createElement('canvas');
+    p.style.cssText = 'width:100%;height:100%;display:block;background:#000;';
+    return { placeholder: p, isProxy: true };
   })() : { placeholder: canvas, isProxy: false };
 
-  // hide video but keep it playing
-  const prevVis = videoEl.style.visibility;
-  videoEl.style.visibility = 'hidden';
-
-  // insert DOM canvas placeholder next to the video
-  const wrapper = videoEl.parentElement || document.body;
-  if (domCanvas.isProxy) {
-    // add placeholder for offscreen canvas presentation
-    wrapper.appendChild(domCanvas.placeholder);
-  } else {
-    wrapper.appendChild(canvas);
+  if (!domCanvas.isProxy) {
+    canvas.style.cssText = 'width:100%;height:100%;display:block;background:#000;';
   }
 
-  // state storage
+  const prevVis = videoEl.style.visibility;
+  videoEl.style.visibility = 'hidden';
+  const wrapper = videoEl.parentElement || document.body;
+  wrapper.appendChild(domCanvas.placeholder);
+
   const state = {
-    canvas: isOffscreen ? canvas : canvas, // store offscreen or dom canvas
-    ctx: isOffscreen ? canvas.getContext('2d') : ctx,
-    rafId: null,
-    rvfcId: null,
-    stopFn: null,
+    canvas, ctx, isOffscreen,
     prevVisibility: prevVis,
-    isOffscreen,
-    placeholderEl: domCanvas.isProxy ? domCanvas.placeholder : null
+    placeholderEl: domCanvas.placeholder,
+    stopFn: null
   };
   canvasState.set(videoEl, state);
 
-  // Start draw loop.
-  // If OffscreenCanvas was created, we'll draw into offscreen and transfer frames to placeholder using transferToImageBitmap
   if (isOffscreen) {
-    // draw into offscreen using rvfc/raf, then copy to placeholder
-    const drawToOffscreen = (now, meta) => {
-      // createImageBitmap from video into offscreen? Instead drawImage into offscreen ctx.
+    const drawToOffscreen = () => {
       try {
-        // resize offscreen if needed
         if (canvas.width !== videoEl.videoWidth || canvas.height !== videoEl.videoHeight) {
           canvas.width = videoEl.videoWidth || canvas.width;
           canvas.height = videoEl.videoHeight || canvas.height;
         }
-        const offCtx = state.ctx;
-        offCtx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-      } catch (e) {
-        // ignore
-      }
-      // transfer to bitmap and paint to placeholder canvas (main thread)
-      try {
+        state.ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
         const bmp = canvas.transferToImageBitmap();
-        // paint on main-thread placeholder
-        const ph = state.placeholderEl;
-        if (ph && ph.getContext) {
-          const phCtx = ph.getContext('2d');
-          if (ph.width !== bmp.width || ph.height !== bmp.height) {
-            ph.width = bmp.width;
-            ph.height = bmp.height;
-          }
-          phCtx.clearRect(0,0,ph.width,ph.height);
-          phCtx.drawImage(bmp, 0, 0, ph.width, ph.height);
+        const phCtx = state.placeholderEl.getContext('2d');
+        if (state.placeholderEl.width !== bmp.width || state.placeholderEl.height !== bmp.height) {
+          state.placeholderEl.width = bmp.width;
+          state.placeholderEl.height = bmp.height;
         }
+        phCtx.drawImage(bmp, 0, 0);
         bmp.close?.();
-      } catch (err) {
-        // fallback: nothing
-      } finally {
-        if (videoEl.requestVideoFrameCallback) {
-          state.rvfcId = videoEl.requestVideoFrameCallback(drawToOffscreen);
-        } else {
-          state.rafId = requestAnimationFrame(drawToOffscreen);
-        }
-      }
+      } catch (e) {}
+      if (videoEl.requestVideoFrameCallback) state.rvfcId = videoEl.requestVideoFrameCallback(drawToOffscreen);
+      else state.rafId = requestAnimationFrame(drawToOffscreen);
     };
-
-    // start
     if (videoEl.requestVideoFrameCallback) state.rvfcId = videoEl.requestVideoFrameCallback(drawToOffscreen);
     else state.rafId = requestAnimationFrame(drawToOffscreen);
-
-    // stop function
+    
     state.stopFn = () => {
-      if (state.rvfcId && videoEl.cancelVideoFrameCallback) {
-        try { videoEl.cancelVideoFrameCallback(state.rvfcId); } catch {}
-      }
-      if (state.rafId) try { cancelAnimationFrame(state.rafId); } catch {}
-      // remove placeholder
-      if (state.placeholderEl && state.placeholderEl.parentNode) state.placeholderEl.parentNode.removeChild(state.placeholderEl);
+      if (state.rvfcId && videoEl.cancelVideoFrameCallback) videoEl.cancelVideoFrameCallback(state.rvfcId);
+      if (state.rafId) cancelAnimationFrame(state.rafId);
+      if (state.placeholderEl.parentNode) state.placeholderEl.parentNode.removeChild(state.placeholderEl);
       videoEl.style.visibility = state.prevVisibility || '';
       canvasState.delete(videoEl);
     };
   } else {
-    // DOM canvas path: use requestVideoFrameCallback + createImageBitmap if available
     const stopLoop = startRvfcDraw(videoEl, state);
     state.stopFn = () => {
       stopLoop();
-      if (state.canvas && state.canvas.parentNode) state.canvas.parentNode.removeChild(state.canvas);
+      if (state.canvas.parentNode) state.canvas.parentNode.removeChild(state.canvas);
       videoEl.style.visibility = state.prevVisibility || '';
       canvasState.delete(videoEl);
     };
   }
 
-  // request fullscreen on the placeholder or canvas DOM node
-  const nodeToFs = state.isOffscreen ? state.placeholderEl : state.canvas;
-  if (!nodeToFs) {
-    // something wrong: cleanup and try direct video fullscreen as last resort
-    state.stopFn();
-    try { if (videoEl.requestFullscreen) videoEl.requestFullscreen(); } catch {}
-    return;
-  }
-
+  const nodeToFs = state.placeholderEl || state.canvas;
   try {
     if (nodeToFs.requestFullscreen) await nodeToFs.requestFullscreen();
     else if (nodeToFs.webkitRequestFullscreen) await nodeToFs.webkitRequestFullscreen();
-    else if (nodeToFs.msRequestFullscreen) await nodeToFs.msRequestFullscreen();
-  } catch (err) {
-    // if fullscreen failed, cleanup and fallback to direct video fullscreen
+  } catch (e) {
     state.stopFn();
-    try { if (videoEl.requestFullscreen) await videoEl.requestFullscreen(); } catch {}
+    try { videoEl.requestFullscreen(); } catch {}
     return;
   }
 
-  // listen for fullscreen exit to cleanup
-  function onFsChange() {
-    const fsEl = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
-    if (fsEl !== nodeToFs) {
-      // fullscreen ended
-      try { state.stopFn(); } catch (e) {}
+  const onFsChange = () => {
+    if (!(document.fullscreenElement || document.webkitFullscreenElement)) {
+      state.stopFn();
       document.removeEventListener('fullscreenchange', onFsChange);
       document.removeEventListener('webkitfullscreenchange', onFsChange);
-      document.removeEventListener('msfullscreenchange', onFsChange);
     }
-  }
+  };
   document.addEventListener('fullscreenchange', onFsChange);
   document.addEventListener('webkitfullscreenchange', onFsChange);
-  document.addEventListener('msfullscreenchange', onFsChange);
 }
 // -------------------------------------------------------------------------
 
-// create or reuse RTCPeerConnection
+// Helper to add tracks
+function addLocalTracksToPc(pc, stream) {
+  const senders = pc.getSenders();
+  const videoTrack = stream.getVideoTracks()[0];
+  let replaced = false;
+
+  // Try to replace existing sender first (cleaner renegotiation)
+  if (senders.length) {
+    for (const s of senders) {
+      if (s.track && s.track.kind === 'video') {
+        s.replaceTrack(videoTrack).catch(() => {});
+        trySetMaxBitrate(s, 8000);
+        replaced = true;
+        break;
+      }
+    }
+  }
+
+  if (!replaced) {
+    stream.getTracks().forEach(track => {
+      const s = pc.addTrack(track, stream);
+      trySetMaxBitrate(s, 8000);
+    });
+  }
+}
+
 function ensurePeerConnection(){
   if (pc) return pc;
   pc = new RTCPeerConnection(pcConfig);
@@ -314,156 +234,125 @@ function ensurePeerConnection(){
   };
 
   pc.ontrack = (e) => {
-    const streams = e.streams;
-    if (!streams || streams.length === 0) return;
-    const stream = streams[0];
-    const id = stream.id || (e.track && e.track.id) || Math.random().toString(36).slice(2,9);
-    let wrapper = document.getElementById('wrapper-' + id);
+    const stream = e.streams[0] || new MediaStream([e.track]);
+    const id = stream.id; 
+    // Sometimes stream ID is same, check if element exists
     let videoEl = document.getElementById('remote-' + id);
-
+    
+    // Fallback ID if stream.id is unstable
+    const domId = 'remote-' + (videoEl ? id : Math.random().toString(36).substr(2,9));
+    
     if (!videoEl) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'video-card';
+      wrapper.id = 'wrapper-' + domId;
+      
       videoEl = document.createElement('video');
-      videoEl.id = 'remote-' + id;
+      videoEl.id = domId;
       videoEl.autoplay = true;
       videoEl.playsInline = true;
       videoEl.controls = false;
-      videoEl.style.display = 'block';
       videoEl.style.width = '100%';
-      videoEl.style.height = 'auto';
-      videoEl.style.maxHeight = '80vh';
       videoEl.style.background = '#000';
       videoEl.addEventListener('dblclick', () => canvasFullscreenFallback(videoEl));
 
-      wrapper = document.createElement('div');
-      wrapper.id = 'wrapper-' + id;
-      wrapper.className = 'video-card';
-      const badge = document.createElement('div');
-      badge.className = 'badge';
-      badge.textContent = 'Remote';
-      wrapper.appendChild(badge);
-      wrapper.appendChild(videoEl);
-
       const btn = document.createElement('button');
       btn.textContent = 'Fullscreen';
-      btn.style.marginTop = '8px';
+      btn.style.marginTop = '5px';
       btn.onclick = () => canvasFullscreenFallback(videoEl);
-      wrapper.appendChild(btn);
 
+      wrapper.appendChild(document.createTextNode('Remote Stream'));
+      wrapper.appendChild(videoEl);
+      wrapper.appendChild(btn);
       remotesContainer.appendChild(wrapper);
     }
 
     if (videoEl.srcObject !== stream) {
-      try {
-        videoEl.srcObject = stream;
-        setTimeout(()=>{ videoEl.play().catch(()=>{}); }, 50);
-      } catch (err) {
-        console.warn('Failed to set srcObject or play', err);
-      }
+      videoEl.srcObject = stream;
+      videoEl.play().catch(console.error);
     }
-
-    appendLog(remoteInfo, 'Remote streams: ' + remotesContainer.querySelectorAll('video').length);
   };
-
-  pc.onconnectionstatechange = () => {
-    appendLog(localInfo, 'Connection: ' + pc.connectionState);
-  };
-
+  
   return pc;
 }
 
-// set sender bitrate where possible
 async function trySetMaxBitrate(sender, kbps) {
   if (!sender || !sender.getParameters) return;
   try {
     const params = sender.getParameters();
     if (!params.encodings) params.encodings = [{}];
-    params.encodings.forEach(e => {
-      e.maxBitrate = kbps * 1000;
-      e.priority = 'high';
-    });
+    params.encodings[0].maxBitrate = kbps * 1000;
+    params.encodings[0].priority = 'high';
     await sender.setParameters(params);
-  } catch (e) { /* ignore */ }
+  } catch (e) {}
 }
 
-// share screen with chosen constraints
 shareBtn.onclick = async () => {
   if (!room) return alert('Join a room first.');
   const q = qualitySelect.value;
   let constraints;
-  if (q === 'high') constraints = { video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } }, audio: false };
-  else if (q === 'medium') constraints = { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }, audio: false };
-  else constraints = { video: { width: { ideal: 854 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }, audio: false };
+  
+  if (q === 'high') constraints = { video: { width: 1920, height: 1080, frameRate: 60 }, audio: false };
+  else if (q === 'medium') constraints = { video: { width: 1280, height: 720, frameRate: 30 }, audio: false };
+  else constraints = { video: { width: 854, height: 480, frameRate: 24 }, audio: false };
 
   try {
     localStream = await navigator.mediaDevices.getDisplayMedia(constraints);
-  } catch (err) {
-    return alert('Failed to get display media: ' + (err.message || err));
-  }
+  } catch (err) { return alert('Share failed: ' + err.message); }
 
   localVideo.srcObject = localStream;
-  try { await localVideo.play(); } catch (e) {}
+  localVideo.play().catch(()=>{});
   shareBtn.disabled = true;
   stopBtn.disabled = false;
 
   ensurePeerConnection();
-
-  const senders = pc.getSenders ? pc.getSenders() : [];
-  const videoTrack = localStream.getVideoTracks()[0];
-
-  let replaced = false;
-  if (senders && senders.length) {
-    for (const s of senders) {
-      if (s.track && s.track.kind === 'video') {
-        try {
-          await s.replaceTrack(videoTrack);
-          await trySetMaxBitrate(s, 8000);
-          replaced = true;
-          break;
-        } catch (e) {}
-      }
-    }
-  }
-
-  if (!replaced) {
-    localStream.getTracks().forEach(track => {
-      const sender = pc.addTrack(track, localStream);
-      trySetMaxBitrate(sender, 8000);
-    });
-  }
+  addLocalTracksToPc(pc, localStream);
 
   try {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     socket.emit('offer', { room, desc: pc.localDescription });
-  } catch (e) {
-    console.error('Offer failed', e);
-  }
+  } catch (e) { console.error('Offer failed', e); }
 
-  const vt = localStream.getVideoTracks()[0];
-  if (vt) vt.addEventListener('ended', () => stopSharing());
+  localStream.getVideoTracks()[0].onended = () => stopSharing();
 };
 
-// stop sharing local screen
 function stopSharing() {
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
     localStream = null;
     localVideo.srcObject = null;
   }
-  // clean up any canvas state for local video
-  if (canvasState.has(localVideo)) {
-    try { canvasState.get(localVideo).stopFn(); } catch (e) {}
-  }
+  if (canvasState.has(localVideo)) canvasState.get(localVideo).stopFn();
   shareBtn.disabled = false;
   stopBtn.disabled = true;
+  // Note: we keep the connection open, just stop sending tracks if desired, 
+  // but for simplicity we assume stopping share doesn't kill the socket connection.
 }
 
-// signalling handlers
-socket.on('connect', () => {
-  appendLog(localInfo, 'Connected');
-});
+socket.on('connect', () => appendLog(localInfo, 'Connected'));
 
-socket.on('peer-joined', () => appendLog(localInfo, `Peer joined`));
+// --- FIX: Late Joiner Logic ---
+socket.on('peer-joined', async () => {
+  appendLog(localInfo, `Peer joined.`);
+  
+  // If I am currently sharing, I must initiate a new offer 
+  // so the new peer receives the stream.
+  if (localStream && pc) {
+    appendLog(localInfo, 'Syncing stream to new peer...');
+    try {
+      // Re-ensure tracks are attached (in case of connection hiccups)
+      addLocalTracksToPc(pc, localStream);
+
+      // Create a fresh offer (renegotiation)
+      const offer = await pc.createOffer({ offerToReceiveVideo: true });
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { room, desc: pc.localDescription });
+    } catch (e) {
+      console.error('Error syncing to new peer', e);
+    }
+  }
+});
 
 socket.on('offer', async ({ from, desc }) => {
   ensurePeerConnection();
@@ -472,38 +361,20 @@ socket.on('offer', async ({ from, desc }) => {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     socket.emit('answer', { room, desc: pc.localDescription });
-  } catch (e) {
-    console.error('Error handling offer', e);
-  }
+  } catch (e) { console.error('Handle offer error', e); }
 });
 
 socket.on('answer', async ({ from, desc }) => {
-  try {
-    if (!pc) return;
-    await pc.setRemoteDescription(desc);
-  } catch (e) {
-    console.error('Error setting remote desc', e);
-  }
+  if (!pc) return;
+  try { await pc.setRemoteDescription(desc); } catch (e) {}
 });
 
-socket.on('ice-candidate', async ({ from, candidate }) => {
-  if (!candidate) return;
-  try {
-    await ensurePeerConnection().addIceCandidate(candidate);
-  } catch (e) {
-    console.warn('Error adding ICE candidate', e);
-  }
+socket.on('ice-candidate', async ({ candidate }) => {
+  try { await ensurePeerConnection().addIceCandidate(candidate); } catch (e) {}
 });
 
-// stop button
-stopBtn.onclick = () => stopSharing();
+// hydrate room from URL
+const p = new URLSearchParams(location.search);
+if (p.get('room')) roomInput.value = p.get('room');
 
-// hydrate room from URL if provided
-(function hydrateFromUrl(){
-  const p = new URLSearchParams(location.search);
-  const r = p.get('room');
-  if (r) roomInput.value = r;
-})();
-
-// double-click local video to canvas fullscreen
 localVideo.addEventListener('dblclick', () => canvasFullscreenFallback(localVideo));
