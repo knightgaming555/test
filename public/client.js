@@ -1,12 +1,12 @@
-// client.js - two-way screen share with fullscreen fix + quality knobs
-const socket = io();
+// public/client.js
+// Two-way screen share with canvas fullscreen fallback to avoid green/black frames.
 
+const socket = io();
 const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 let pc = null;
 let localStream = null;
 let room = null;
-let clientId = null;
 
 // UI
 const localVideo = document.getElementById('localVideo');
@@ -37,48 +37,115 @@ copyUrlBtn.onclick = async () => {
   catch { appendLog(localInfo, 'Copy failed'); }
 };
 
-localFullBtn.onclick = () => enterFullscreen(localVideo);
+localFullBtn.onclick = () => canvasFullscreenFallback(localVideo);
 
 function appendLog(el, txt){ el.textContent = txt; }
 
-// ---------- Fullscreen helpers (fixes black screen) ----------
-async function enterFullscreen(el){
-  if (!el) return;
-  // request fullscreen on the video element (not wrapper)
+// ---------- Canvas fullscreen fallback utilities ----------
+const canvasState = new Map(); // map videoEl -> {canvas, ctx, rafId}
+
+function createCanvasForVideo(videoEl){
+  const rect = videoEl.getBoundingClientRect();
+  const w = videoEl.videoWidth || Math.max(1280, Math.round(rect.width));
+  const h = videoEl.videoHeight || Math.max(720, Math.round(rect.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  canvas.style.background = '#000';
+  canvas.style.display = 'block';
+  canvas.className = 'fullscreen-canvas';
+  const ctx = canvas.getContext('2d');
+  return { canvas, ctx, w, h };
+}
+
+function startCanvasDrawLoop(videoEl, canvas, ctx, dims){
+  let running = true;
+  async function draw(){
+    if (!running) return;
+    try {
+      // draw current video frame
+      // if video dimension changed, adjust canvas
+      if (videoEl.videoWidth && videoEl.videoHeight &&
+          (canvas.width !== videoEl.videoWidth || canvas.height !== videoEl.videoHeight)) {
+        canvas.width = videoEl.videoWidth;
+        canvas.height = videoEl.videoHeight;
+      }
+      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+    } catch (e) {
+      // ignore transient errors (video not ready)
+    }
+    const id = requestAnimationFrame(draw);
+    canvasState.get(videoEl).rafId = id;
+  }
+  draw();
+  return () => { running = false; };
+}
+
+function cleanupCanvasState(videoEl){
+  const state = canvasState.get(videoEl);
+  if (!state) return;
+  if (state.rafId) cancelAnimationFrame(state.rafId);
+  if (state.canvas && state.canvas.parentNode) state.canvas.parentNode.removeChild(state.canvas);
+  // restore video element visibility if hidden
+  videoEl.style.visibility = state.prevVisibility || '';
+  canvasState.delete(videoEl);
+}
+
+// Fullscreen a canvas that mirrors the video to avoid GPU overlay issues
+async function canvasFullscreenFallback(videoEl){
+  if (!videoEl) return;
+  // If already active for this video, just return
+  if (canvasState.has(videoEl)) return;
+
+  // Ensure video is playing
+  try { await videoEl.play(); } catch (e) {}
+
+  // create canvas and start drawing
+  const { canvas, ctx } = createCanvasForVideo(videoEl);
+  const prevVisibility = videoEl.style.visibility;
+  // hide video but keep it playing
+  videoEl.style.visibility = 'hidden';
+
+  // insert canvas next to video element's wrapper (so CSS looks correct)
+  const wrapper = videoEl.parentNode || document.body;
+  wrapper.appendChild(canvas);
+
+  canvasState.set(videoEl, { canvas, ctx, rafId: null, prevVisibility });
+
+  // start loop
+  const stopLoop = startCanvasDrawLoop(videoEl, canvas, ctx);
+
+  // request fullscreen on canvas
   try {
-    if (el.requestFullscreen) await el.requestFullscreen();
-    else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
-    else if (el.msRequestFullscreen) await el.msRequestFullscreen();
+    if (canvas.requestFullscreen) await canvas.requestFullscreen();
+    else if (canvas.webkitRequestFullscreen) await canvas.webkitRequestFullscreen();
+    else if (canvas.msRequestFullscreen) await canvas.msRequestFullscreen();
   } catch (err) {
-    console.warn('Fullscreen request failed', err);
+    // fallback: try to fullscreen the video element itself if canvas fullscreen failed
+    console.warn('Canvas fullscreen request failed, falling back to direct video fullscreen', err);
+    cleanupCanvasState(videoEl);
+    try { if (videoEl.requestFullscreen) await videoEl.requestFullscreen(); } catch {}
+    return;
   }
-  // ensure playback restarts and force a repaint
-  try { await el.play(); } catch (e) { /* ignore */ }
-  forceRepaint(el);
-}
 
-function forceRepaint(el){
-  // a tiny GPU hint and repaint hack that's effective in most browsers
-  el.style.transform = 'translateZ(0)';
-  // small timeout to clear the hack
-  setTimeout(() => { el.style.transform = ''; }, 120);
-}
-
-// handle fullscreen change to re-play & repaint remote video(s)
-function onFullScreenChange(){
-  const fs = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
-  if (fs && fs.tagName === 'VIDEO') {
-    try { fs.play(); } catch (e) {}
-    forceRepaint(fs);
-  } else {
-    // when exiting fullscreen, try to play local video again
-    try { localVideo.play(); } catch (e) {}
+  // store a listener to cleanup when fullscreen exits
+  function onFsChange(){
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
+    if (fsEl !== canvas) {
+      // fullscreen ended or changed to something else -> stop and cleanup
+      cleanupCanvasState(videoEl);
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
+      document.removeEventListener('msfullscreenchange', onFsChange);
+    }
   }
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
+  document.addEventListener('msfullscreenchange', onFsChange);
 }
-document.addEventListener('fullscreenchange', onFullScreenChange);
-document.addEventListener('webkitfullscreenchange', onFullScreenChange);
-document.addEventListener('msfullscreenchange', onFullScreenChange);
-// ---------------------------------------------------------------
+// ------------------------------------------------------------
 
 // create or reuse RTCPeerConnection
 function ensurePeerConnection(){
@@ -93,24 +160,23 @@ function ensurePeerConnection(){
     const streams = e.streams;
     if (!streams || streams.length === 0) return;
     const stream = streams[0];
-    // try to find an existing element by stream id
     const id = stream.id || (e.track && e.track.id) || Math.random().toString(36).slice(2,9);
     let wrapper = document.getElementById('wrapper-' + id);
     let videoEl = document.getElementById('remote-' + id);
 
     if (!videoEl) {
-      // create elements
       videoEl = document.createElement('video');
       videoEl.id = 'remote-' + id;
       videoEl.autoplay = true;
       videoEl.playsInline = true;
+      videoEl.muted = false;
       videoEl.controls = false;
       videoEl.style.display = 'block';
       videoEl.style.width = '100%';
       videoEl.style.height = 'auto';
       videoEl.style.maxHeight = '80vh';
       videoEl.style.background = '#000';
-      videoEl.addEventListener('dblclick', () => enterFullscreen(videoEl));
+      videoEl.addEventListener('dblclick', () => canvasFullscreenFallback(videoEl));
 
       wrapper = document.createElement('div');
       wrapper.id = 'wrapper-' + id;
@@ -121,11 +187,10 @@ function ensurePeerConnection(){
       wrapper.appendChild(badge);
       wrapper.appendChild(videoEl);
 
-      // fullscreen button (keeps focus on video element)
       const btn = document.createElement('button');
       btn.textContent = 'Fullscreen';
       btn.style.marginTop = '8px';
-      btn.onclick = () => enterFullscreen(videoEl);
+      btn.onclick = () => canvasFullscreenFallback(videoEl);
       wrapper.appendChild(btn);
 
       remotesContainer.appendChild(wrapper);
@@ -135,10 +200,9 @@ function ensurePeerConnection(){
     if (videoEl.srcObject !== stream) {
       try {
         videoEl.srcObject = stream;
-        // small delay then play to avoid black frame issues in some browsers
+        // small delay then play
         setTimeout(() => {
           videoEl.play().catch(()=>{});
-          forceRepaint(videoEl);
         }, 50);
       } catch (err) {
         console.warn('Failed to set srcObject or play', err);
@@ -166,9 +230,7 @@ async function trySetMaxBitrate(sender, kbps) {
       e.priority = 'high';
     });
     await sender.setParameters(params);
-  } catch (e) {
-    // browsers may refuse, ignore
-  }
+  } catch (e) { /* ignore if not supported */ }
 }
 
 // share screen with chosen constraints
@@ -225,7 +287,6 @@ shareBtn.onclick = async () => {
     console.error('Offer failed', e);
   }
 
-  // stop sharing when user stops in browser
   const vt = localStream.getVideoTracks()[0];
   if (vt) vt.addEventListener('ended', () => stopSharing());
 };
@@ -243,13 +304,10 @@ function stopSharing() {
 
 // signalling handlers
 socket.on('connect', () => {
-  clientId = socket.id;
-  appendLog(localInfo, 'Connected: ' + clientId);
+  appendLog(localInfo, 'Connected');
 });
 
-socket.on('peer-joined', () => {
-  appendLog(localInfo, `Peer joined`);
-});
+socket.on('peer-joined', () => appendLog(localInfo, `Peer joined`));
 
 socket.on('offer', async ({ from, desc }) => {
   ensurePeerConnection();
@@ -291,5 +349,5 @@ stopBtn.onclick = () => stopSharing();
   if (r) roomInput.value = r;
 })();
 
-// double-click local video to fullscreen
-localVideo.addEventListener('dblclick', () => enterFullscreen(localVideo));
+// double-click local video to canvas fullscreen
+localVideo.addEventListener('dblclick', () => canvasFullscreenFallback(localVideo));
